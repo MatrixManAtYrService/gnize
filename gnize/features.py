@@ -139,6 +139,8 @@ class Params:
         "feature_threshold": 0x00FF,
         "max_feature_len": 150,
         "parallel": True,
+        "batch_size_divisor": 100,
+        "batch_increase_divisor": 1000,
     }
 
     def __init__(self, **kwargs):
@@ -164,6 +166,8 @@ class Stats:
         "features_found",
         "passes",
         "processes_used",
+        "start_batch_size",
+        "batch_size_increase",
     ]
 
     def __init__(self):
@@ -338,23 +342,31 @@ def all_subs(target: str, params=Params()) -> dict:
             batch_num = 0
             return_queue = Queue()
 
-            # todo: parameterize
-            tasks = 50
+            # the first chunks of work ar the heaviest, so carve off
+            # larger chunks later
+            batch_size = max(
+                5, math.ceil(len(target) / current_params.batch_size_divisor)
+            )
+            batch_size_increase = max(
+                1, math.ceil(len(target) / current_params.batch_increase_divisor)
+            )
+
+            stats.start_batch_size = batch_size
+            stats.batch_size_increase = batch_size_increase
 
             # assign the work to batches
             while offset_front_anchored_substrings:
 
                 # as tasks get smaller, allocate more of them to a thread
                 work = []
-                for _ in range(tasks):
+                for _ in range(batch_size):
                     try:
                         work.append(offset_front_anchored_substrings.pop())
                         work.append(offset_front_anchored_substrings.pop())
                     except IndexError:
                         pass
 
-                # todo: parameterize
-                tasks += 5
+                batch_size += batch_size_increase
 
                 prepared_batches.append((return_queue, work, current_params, batch_num))
                 batch_num += 1
