@@ -114,11 +114,11 @@ import argparse
 import math
 import logging
 import timeit
+from multiprocessing import Manager, Queue, Process
 from copy import deepcopy
 from pyfinite import ffield
 from gnize import galois
 from sortedcontainers import SortedDict
-from threading import Thread
 from collections import namedtuple
 from textwrap import indent
 
@@ -138,9 +138,7 @@ class Params:
         "skip_prefix": False,
         "feature_threshold": 0x00FF,
         "max_feature_len": 150,
-        # ratio of smallest batch to largest batch
-        "batch_reduction": 0.5,
-        "parallel": False,
+        "parallel": True,
     }
 
     def __init__(self, **kwargs):
@@ -165,12 +163,16 @@ class Stats:
         "fruitless_feature_searches",
         "features_found",
         "passes",
-        "threads_used",
+        "processes_used",
     ]
 
     def __init__(self):
         for counter in Stats.counters:
             setattr(self, counter, 0)
+            self.start = timeit.default_timer()
+
+    def finalize(self):
+        self.time = timeit.default_timer() - self.start
 
     def update(self, other):
         for counter in Stats.counters:
@@ -185,6 +187,7 @@ class Stats:
         lines = []
         for counter in Stats.counters:
             lines.append(f"{counter} = {getattr(self, counter)}")
+        lines.append(f"time = {self.time}")
         return "\n".join(lines)
 
 
@@ -252,6 +255,34 @@ class Fingerprints:
                 self.dict[score][coords] = text[start:end]
 
 
+def batch_worker(batch):
+    """
+    Called by the multiprocessing module, does a portion of the work
+    parceled out by all_subs
+    """
+
+    start = timeit.default_timer()
+
+    return_queue, tasks, params, batch_num = batch
+
+    op_count = sum(map(len, [task[1] for task in tasks]))
+    logging.debug(f"Batch: {batch_num} Size:{op_count}")
+
+    _fingerprints = Fingerprints()
+    _stats = Stats()
+
+    for offset, target_substr in tasks:
+        result = from_start(offset, target_substr, params)
+        _fingerprints.merge(result.fingerprints)
+        _stats.update(result.stats)
+
+    return_queue.put(Result(_fingerprints, _stats))
+
+    stop = timeit.default_timer()
+
+    logging.debug("Batch: {}, Finished In: {}".format(batch_num, stop - start))
+
+
 def all_subs(target: str, params=Params()) -> dict:
     """
     Scan all substrings of the target for fingerprints, return only the
@@ -269,7 +300,7 @@ def all_subs(target: str, params=Params()) -> dict:
         current_params.prefix_threshold = attempt
         stats.passes += 1
 
-        front_anchored_substrings = []
+        offset_front_anchored_substrings = []
         # suppose target="abcdefghijklmnopqrstuvwxyz", then this loop creates:
         # abcdefghijklmnopqrstuvwxyz
         # bcdefghijklmnopqrstuvwxyz
@@ -279,7 +310,7 @@ def all_subs(target: str, params=Params()) -> dict:
         # yz
         # z
         for i in range(len(target)):
-            front_anchored_substrings.insert(0, (i, target[i:]))
+            offset_front_anchored_substrings.insert(0, (i, target[i:]))
 
         # this seems like a problem that would benefit from parallelism
         # but I can't get parallel to go faster than serial
@@ -288,7 +319,7 @@ def all_subs(target: str, params=Params()) -> dict:
         if not current_params.parallel:
 
             # single threaded
-            for offset, task in front_anchored_substrings:
+            for offset, task in offset_front_anchored_substrings:
                 result = from_start(offset, task, current_params)
                 fingerprints.merge(result.fingerprints)
                 stats.update(result.stats)
@@ -297,72 +328,51 @@ def all_subs(target: str, params=Params()) -> dict:
 
         else:
 
-            # scale threads to workload
-            # logging.basicConfig(
-            #    level=logging.DEBUG,
-            #    format="%(relativeCreated)6d %(threadName)s %(message)s",
-            # )
-            threads = []
+            logging.basicConfig(
+                level=logging.DEBUG,
+                format="%(relativeCreated)6d %(threadName)s %(message)s",
+            )
 
-            # preallocate results for multithreaded access
-            # I get race conditions if I use results.append()
-            results = [None] * math.ceil(len(target) / 2)
-
-            thread_idx = 0
+            processes = []
+            prepared_batches = []
+            batch_num = 0
+            return_queue = Queue()
 
             # todo: parameterize
-            tasks = 10
+            tasks = 50
 
-            # while there's unassigned work
-            while front_anchored_substrings:
+            # assign the work to batches
+            while offset_front_anchored_substrings:
 
                 # as tasks get smaller, allocate more of them to a thread
                 work = []
                 for _ in range(tasks):
                     try:
-                        work.append(front_anchored_substrings.pop())
-                        work.append(front_anchored_substrings.pop())
+                        work.append(offset_front_anchored_substrings.pop())
+                        work.append(offset_front_anchored_substrings.pop())
                     except IndexError:
                         pass
 
                 # todo: parameterize
-                tasks += 2
+                tasks += 5
 
-                # each thread does this
-                def go(results, thread_idx, work):
+                prepared_batches.append((return_queue, work, current_params, batch_num))
+                batch_num += 1
 
-                    start = timeit.default_timer()
-
-                    _fingerprints = Fingerprints()
-                    _stats = Stats()
-
-                    for task in work:
-                        offset, target_substr = task
-                        result = from_start(offset, target_substr, current_params)
-                        _fingerprints.merge(result.fingerprints)
-                        _stats.update(result.stats)
-
-                    results[thread_idx] = Result(_fingerprints, _stats)
-
-                    stop = timeit.default_timer()
-
-                    logging.debug("Time: {}".format(stop - start))
-
-                thread = Thread(target=go, args=(results, thread_idx, work))
-                thread.start()
-                threads.append(thread)
-                thread_idx += 1
-                stats.threads_used += 1
-
-            # wait for threads to finish
-            for thread in threads:
-                thread.join()
+            # start processing batches
+            for batch in prepared_batches:
+                p = Process(target=batch_worker, args=(batch,))
+                processes.append(p)
+                p.start()
 
             # aggregate results
-            for result in results:
-                if result:
-                    fingerprints.merge(result.fingerprints)
-                    stats.update(result.stats)
+            for result in [return_queue.get() for p in processes]:
+                fingerprints.merge(result.fingerprints)
+                stats.update(result.stats)
+
+            # clean up processes
+            # for process in processes:
+            # p.join()
 
         fingerprints.set_substrings(target)
 
@@ -484,10 +494,10 @@ def from_start(offset: int, target: str, params: Params) -> Result:
 def fromcli():
 
     parser = argparse.ArgumentParser(description="read stdin, write gnize fingerprints")
-    parser.add_argument("-s", "--stats", action="store_true")
+    parser.add_argument("-t", "--stats", action="store_true")
     parser.add_argument("-n", "--no-prints", action="store_true")
     parser.add_argument("-a", "--all", action="store_true")
-    parser.add_argument("-p", "--parallel", action="store_true")
+    parser.add_argument("-s", "--serial", action="store_true")
 
     args = parser.parse_args()
     params = Params()
@@ -508,8 +518,8 @@ def fromcli():
         params.prefix_threshold = 0xFFFF
         params.feature_threshold = 0xFFFF
 
-    if args.parallel:
-        params.parallel = True
+    if args.serial:
+        params.parallel = False
 
     fingerprints, stats = all_subs(message, params)
 
@@ -521,5 +531,6 @@ def fromcli():
             print(fingerprints.as_json())
 
     # -s => print stats
+    stats.finalize()
     if args.stats:
         print(stats, file=sys.stderr)
