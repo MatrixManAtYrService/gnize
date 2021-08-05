@@ -9,10 +9,11 @@ setup(
     author_email="gnize@matt.rixman.org",
     packages=["gnize"],
     python_requires=">=3.8",
-    install_requires=["pyrabin", "conducto"],
+    install_requires=["pyfinite", "prompt_toolkit", "sortedcontainers", "pyyaml", "dataclasses_json", "dacite", "py-multihash"],
     entry_points={
         "console_scripts": [
-            "gn = gnize.features:fromcli",
+            "gn = gnize.cli:gn",
+            "cog = gnize.cli:cog",
         ]
     },
 )

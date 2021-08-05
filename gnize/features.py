@@ -54,7 +54,7 @@ polynomial:
 
     1100010001001011
 
-(Irreducible polynomials act like prim numbers in this space, dividing
+(Irreducible polynomials act like prime numbers in this space, dividing
 by them is likely to create remainers.)
 
 Viewed through channel 964, ¢'s fingerprint is...
