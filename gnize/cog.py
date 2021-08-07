@@ -48,10 +48,141 @@ signal, and building consensus on one to treat as cannonical, is a separate
 problem.  For now we just want create canvasses and query for them by fingerprints.
 """
 
-from gnize import features, dotdir
+import sys
+import pty
+from dataclasses import dataclass
+from textwrap import dedent
+from pprint import pformat
+
+from prompt_toolkit import Application
+from prompt_toolkit.enums import EditingMode
+from prompt_toolkit.buffer import Buffer
+from prompt_toolkit.key_binding import KeyBindings
+from prompt_toolkit.layout import Layout
+from prompt_toolkit.layout.containers import HSplit, VSplit, Window, WindowAlign
+from prompt_toolkit.widgets import Frame, HorizontalLine, VerticalLine
+from prompt_toolkit.layout.controls import BufferControl, FormattedTextControl
+
+from gnize import dotdir, features
+
+import IPython
 
 
-def make_canvas(noise):
+@dataclass
+class Subcanvass:
+    content: str
+    is_selected: bool
 
+    def summary_at(self, index=0):
+        flat = self.content.replace("\n", "\\n").strip()
+        prefix = flat[:8]
+        suffix = flat[-8:]
+        index_str = index.rjust(2, "0")
+        if self.is_selected:
+            return f"[*] {prefix}...{suffix}"
+        else:
+            return f"{index_str} {prefix}...{suffix}"
+
+
+def update(event):
+
+    if event.selection_state:
+        selected_from = event.selection_state.original_cursor_position
+        selected_to = event._Buffer__cursor_position
+        debug_display.text += f"{selected_from},{selected_to}"
+    else:
+
+        debug_display.text = pformat(event.__dict__)
+
+
+legend_left = dedent(
+    """
+    Done----Ctrl+D
+    Cancel--Ctrl+C
+    """
+).strip("\n")
+
+legend_center = dedent(
+    """
+    Editor--Ctrl+E
+    """
+).strip("\n")
+
+legend_right = dedent(
+    """
+    Signals--Ctrl+[Shift]+S
+    Gaps-----Ctrl+[Shift]+G
+    """
+).strip("\n")
+
+noise = ""
+signal = ""
+subcanvasses = []
+buffer = Buffer(on_text_changed=update, on_cursor_position_changed=update)
+
+buffer_header = FormattedTextControl(text="Delete noise until only signal remains")
+subcanvasses_header = FormattedTextControl(text="Signal")
+gaps_header = FormattedTextControl(text="Noise")
+
+subcanvasses_display = FormattedTextControl(text="")
+gaps_display = FormattedTextControl(text="")
+debug_display = FormattedTextControl(text="")
+
+selected_idx = 0
+
+root_container = HSplit(
+    [
+        VSplit(
+            [
+                Frame(
+                    title="Delete noise until only signal remains",
+                    body=Window(content=BufferControl(buffer=buffer)),
+                ),
+                Frame(
+                    title="Signals",
+                    body=Window(width=15, content=subcanvasses_display),
+                ),
+                Frame(title="Gaps", body=Window(width=10, content=gaps_display)),
+            ]
+        ),
+        HorizontalLine(),
+        VSplit(
+            [
+                Window(content=FormattedTextControl(text=legend_left)),
+                Window(content=FormattedTextControl(text=legend_center)),
+                Window(
+                    content=FormattedTextControl(text=legend_right),
+                    align=WindowAlign.RIGHT,
+                ),
+            ]
+        ),
+        HorizontalLine(),
+        Window(content=debug_display),
+        HorizontalLine(),
+    ]
+)
+
+
+def make_canvas(_noise):
+
+    global noise
+    noise = _noise
     config = dotdir.make_or_get()
-    print(config.to_dict())
+
+    # start with just one subcanvas, have it selected
+    subcanvasses.append(Subcanvass(content=noise, is_selected=True))
+
+    # start with the input noise as the signal
+    buffer.text = noise
+
+    kb = KeyBindings()
+
+    @kb.add("c-c")
+    def done(event):
+        event.app.exit()
+
+    # https://github.com/prompt-toolkit/python-prompt-toolkit/issues/502#issuecomment-466591259
+    sys.stdin = sys.stderr
+    Application(
+        key_bindings=kb, layout=Layout(root_container), editing_mode=EditingMode.VI
+    ).run()
