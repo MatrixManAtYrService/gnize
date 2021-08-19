@@ -48,6 +48,7 @@ signal, and building consensus on one to treat as cannonical, is a separate
 problem.  For now we just want create canvasses and query for them by fingerprints.
 """
 
+from re import sub
 import sys
 import pty
 from dataclasses import dataclass
@@ -69,30 +70,154 @@ import IPython
 
 
 @dataclass
-class Subcanvass:
-    content: str
-    is_selected: bool
+class Interval:
+    "a subintval of the given noise (might be a subcanvas, might be a gap)"
 
-    def summary_at(self, index=0):
-        flat = self.content.replace("\n", "\\n").strip()
-        prefix = flat[:8]
-        suffix = flat[-8:]
-        index_str = index.rjust(2, "0")
-        if self.is_selected:
-            return f"[*] {prefix}...{suffix}"
+    start: int
+    end: int
+    content: str
+
+    def inside(self, it):
+        return self.start < it < self.end
+
+    def outside(self, it):
+        return it < self.start or it > self.end
+
+    def summary(self, index, cursor_start=0, cursor_stop=None):
+
+        if cursor_stop is None:
+            if self.inside(cursor_start):
+                prefix = "(*)"
+            else:
+                prefix = None
         else:
-            return f"{index_str} {prefix}...{suffix}"
+            if self.inside(cursor_start) and self.outside(cursor_stop):
+                prefix = "(*>"
+            elif self.outside(cursor_start) and self.inside(cursor_stop):
+                prefix = "<*)"
+            elif self.inside(cursor_start) and self.inside(cursor_stop):
+                prefix = "(*)"
+            else:
+                prefix = None
+
+        # if the cursor isn't inside the subcanvas, display the subcanvas index
+        if not prefix:
+            prefix = f"{index}"
+
+        flat = " ".join(self.content.split())
+        width = len(flat)
+        if width > 16:
+            start = flat[:8]
+            end = flat[-8:]
+            connector = ".."
+        elif width > 8:
+            midpoint = int(width / 2)
+            start = flat[:midpoint]
+            end = flat[midpoint:]
+            connector = ".."
+        else:
+            start = flat
+            end = ""
+            connector = ""
+
+        return prefix + f"{start}{connector}{end}"
+
+
+noise = ""
+
+
+class Alternation:
+    def __init__(self):
+
+        # Intervals of this alternation type (gap/subcanvas) go here
+        self.intervals = []
+
+        # The in-progress interval
+        self.current = ""
+
+        # Since when have we been building this interval
+        self.current_start = 0
+
+
+def greedy_align(noise, signal):
+    # TODO: use needleman-wunsch and make this optional
+    # prefer whichever alignment makes the fewest gaps
+
+    sub = Alternation()
+    gap = Alternation()
+
+    for i, c in enumerate(noise):
+        if signal and noise:
+            if noise[0] == signal[0]:
+                # we get signal
+                sub.current += c
+                if gap.current:
+                    # gap interrupted, resume signal, finalize current gap
+                    gap.intervals.append(
+                        Interval(
+                            start=gap.current_start, end=i - 1, content=gap.current
+                        )
+                    )
+                    gap.current = ""
+                signal = signal[1:]
+            else:
+                gap.current += c
+                if sub.current:
+                    # signal interrupted, resume gap, finalize current signal
+                    sub.intervals.append(
+                        Interval(
+                            start=sub.current_start, end=i - 1, content=sub.current
+                        )
+                    )
+                    sub.current = ""
+        else:
+            gap.current += c
+        noise = noise[1:]
+
+    return [x for x in sub.intervals if x], [x for x in gap.intervals if x]
+
+
+subcanvasses = []
+gaps = []
 
 
 def update(event):
+    global subcanvasses
+    global subcanvasses_display
+    global gaps
+    global gaps_display
+    global debug_display
+
+    subcanvasses, gaps = greedy_align(noise, buffer.text)
 
     if event.selection_state:
-        selected_from = event.selection_state.original_cursor_position
-        selected_to = event._Buffer__cursor_position
-        debug_display.text += f"{selected_from},{selected_to}"
+        selected_from = min(
+            event._Buffer__cursor_position,
+            event.selection_state.original_cursor_position,
+        )
+        selected_to = max(
+            event._Buffer__cursor_position,
+            event.selection_state.original_cursor_position,
+        )
+        debug_display.text = f"{len(subcanvasses)} subcanvasses, {len(gaps)} gaps, selected: {selected_from}, {selected_to}"
+        render(
+            subcanvasses, subcanvasses_display, selected_from, cursor_stop=selected_to
+        )
+        render(gaps, gaps_display, selected_from, selected_to)
     else:
+        cursor_position = event._Buffer__cursor_position
+        debug_display.text = f"{len(subcanvasses)} subcanvasses, {len(gaps)} gaps, cursor:{cursor_position}"
+        render(subcanvasses, subcanvasses_display, cursor_position)
+        render(gaps, gaps_display, cursor_position)
 
-        debug_display.text = pformat(event.__dict__)
+
+def render(interval_list, interval_display, cursor_start, cursor_stop=None):
+    interval_display.text = "\n".join(
+        [
+            x.summary(i, cursor_start, cursor_stop=cursor_stop)
+            for i, x in enumerate(interval_list)
+        ]
+    )
 
 
 legend_left = dedent(
@@ -115,9 +240,9 @@ legend_right = dedent(
     """
 ).strip("\n")
 
+
 noise = ""
 signal = ""
-subcanvasses = []
 buffer = Buffer(on_text_changed=update, on_cursor_position_changed=update)
 
 buffer_header = FormattedTextControl(text="Delete noise until only signal remains")
@@ -169,8 +294,7 @@ def make_canvas(_noise):
     noise = _noise
     config = dotdir.make_or_get()
 
-    # start with just one subcanvas, have it selected
-    subcanvasses.append(Subcanvass(content=noise, is_selected=True))
+    subcanvasses.append(Interval(start=0, end=len(noise) - 1, content=noise))
 
     # start with the input noise as the signal
     buffer.text = noise
