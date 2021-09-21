@@ -1,7 +1,7 @@
 from yaml import dump, load, BaseLoader, loader
 from pathlib import Path
 from textwrap import dedent
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from dataclasses_json import dataclass_json
 import multihash
 import json
@@ -34,6 +34,16 @@ class FingerprintStore:
     use: str
     connect: str
 
+default_gap_colors = ["#b58900", "#cb4b16"]
+default_signal_colors = ["#2aa198", "#6c71c4"]
+
+
+@dataclass_json
+@dataclass
+class Colors:
+    gaps : list[str] = field(default_factory=lambda: default_gap_colors)
+    signals : list[str] = field(default_factory=lambda: default_signal_colors)
+
 
 @dataclass_json
 @dataclass
@@ -41,6 +51,9 @@ class Config:
     editor: Editor
     canvasses: CanvasSource
     fingerprints: FingerprintStore
+    colors: Colors
+
+
 
 
 default_config = from_dict(
@@ -49,6 +62,7 @@ default_config = from_dict(
         "editor": {"use": "prompttoolkit", "mode": "vi"},
         "canvasses": {"use": "filesystem", "path": str(dir_path / "canvasses")},
         "fingerprints": {"use": "sqlite3", "connect": str(dir_path / "fingerprints.db")},
+        "colors": {"gaps": default_gap_colors, "signals": default_signal_colors}
     },
 )
 
@@ -126,5 +140,3 @@ def make_or_get():
         cursor.execute("SELECT count(distinct canvas_hash) from prints;")
         count = cursor.fetchone()[0]
         print(f"{count} fingerprints cognized so far", file=sys.stderr)
-
-    return config

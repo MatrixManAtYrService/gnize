@@ -54,6 +54,8 @@ import pty
 from dataclasses import dataclass
 from textwrap import dedent
 from pprint import pformat
+from copy import deepcopy
+from typing import List, Tuple
 
 from prompt_toolkit import Application
 from prompt_toolkit.enums import EditingMode
@@ -61,13 +63,16 @@ from prompt_toolkit.buffer import Buffer
 from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.layout import Layout
 from prompt_toolkit.layout.containers import HSplit, VSplit, Window, WindowAlign
-from prompt_toolkit.widgets import Frame, HorizontalLine, VerticalLine
 from prompt_toolkit.layout.controls import BufferControl, FormattedTextControl
+from prompt_toolkit.widgets import Frame, HorizontalLine, VerticalLine
 
 from gnize import dotdir, features
 
 import IPython
 
+from minineedle import NeedlemanWunsch, ScoreMatrix
+from minineedle.core import Gap
+from rich.console import Console
 
 @dataclass
 class Interval:
@@ -123,58 +128,86 @@ class Interval:
         return prefix + f"{start}{connector}{end}"
 
 
-noise = ""
+def align_and_fix(_signal, _noise) -> Tuple[List[Interval], List[Interval], str]:
 
+    signal = deepcopy(_signal)
+    noise = deepcopy(_noise)
 
-class Alternation:
-    def __init__(self):
+    def align() -> List[Tuple]:
 
-        # Intervals of this alternation type (gap/subcanvas) go here
-        self.intervals = []
+        pair = NeedlemanWunsch(noise, signal)
+        pair.smatrix = ScoreMatrix(match=1, miss=0, gap=-1)
+        pair.align()
+        c, s = pair.get_aligned_sequences()
+        return list(zip(c, s))
 
-        # The in-progress interval
-        self.current = ""
-
-        # Since when have we been building this interval
-        self.current_start = 0
-
-
-def greedy_align(noise, signal):
-    # TODO: use needleman-wunsch and make this optional
-    # prefer whichever alignment makes the fewest gaps
-
-    sub = Alternation()
-    gap = Alternation()
-
-    for i, c in enumerate(noise):
-        if signal and noise:
-            if noise[0] == signal[0]:
-                # we get signal
-                sub.current += c
-                if gap.current:
-                    # gap interrupted, resume signal, finalize current gap
-                    gap.intervals.append(
-                        Interval(
-                            start=gap.current_start, end=i - 1, content=gap.current
-                        )
-                    )
-                    gap.current = ""
-                signal = signal[1:]
-            else:
-                gap.current += c
-                if sub.current:
-                    # signal interrupted, resume gap, finalize current signal
-                    sub.intervals.append(
-                        Interval(
-                            start=sub.current_start, end=i - 1, content=sub.current
-                        )
-                    )
-                    sub.current = ""
+    # overwrite transcription errors with values from canvas
+    c_idx = -1
+    s_idx = -1
+    for c, s in align():
+        if type(c) is Gap:
+            # no data inssertion allowed at this step
+            # overwrite signal from canvas at this location
+            # this means that editor actions that would create new data
+            # can only widen the signal
+            signal[s_idx] = c
         else:
-            gap.current += c
-        noise = noise[1:]
+            c_idx += 1
 
-    return [x for x in sub.intervals if x], [x for x in gap.intervals if x]
+        if type(s) is Gap:
+            # signal is allowed to be less than canvas, do nothing
+            # this lets editor actions that would delete data work as expected
+            pass
+        else:
+            s_idx += 1
+
+    signals = []
+    gaps = []
+    outer_buffer = ""
+    buffer = ""
+    buffer_is_signal = False
+
+    def struck(text):
+        console = Console()
+        with console.capture() as capture:
+            console.print(f"[strike]{text}[/strike]", end='')
+        return capture.get()
+
+    # categorize characters on signal/gap transition
+    for i, (c, s) in enumerate(align()):
+
+        # first past should have eliminated any additions
+        if type(c) is Gap:
+            raise ValueError("signal char {s}(#{s_idx}) cannot be aligned to canvas")
+
+        # interpret deletions as gaps
+        if type(s) is Gap:
+            if buffer_is_signal:
+                signals.append(Interval(i - len(buffer), i, buffer))
+                outer_buffer += buffer
+                buffer = c
+                buffer_is_signal = False
+            else:
+                buffer += c
+        else:
+            if not buffer_is_signal:
+                gaps.append(Interval(i - len(buffer), i, buffer))
+                outer_buffer += struck(buffer)
+                buffer = s
+                buffer_is_signal = True
+            else:
+                buffer += s
+
+    # capture remaining characters
+    if buffer_is_signal:
+        signals.append(Interval(i - len(buffer), i, buffer))
+        outer_buffer += buffer
+    else:
+        gaps.append(Interval(i - len(buffer), i, buffer))
+        outer_buffer += struck(buffer)
+
+
+    return signals, gaps, outer_buffer
 
 
 subcanvasses = []
@@ -188,7 +221,8 @@ def update(event):
     global gaps_display
     global debug_display
 
-    subcanvasses, gaps = greedy_align(noise, buffer.text)
+    subcanvasses, gaps, fixed_buffer = align_and_fix(noise, buffer.text)
+    buffer.text = fixed_buffer
 
     if event.selection_state:
         selected_from = min(
