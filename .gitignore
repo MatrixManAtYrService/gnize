@@ -110,3 +110,5 @@ venv.bak/
 *.swp
 *.sql
 gcloud/
+
+.gnize.debug

@@ -48,35 +48,36 @@ signal, and building consensus on one to treat as cannonical, is a separate
 problem.  For now we just want create canvasses and query for them by fingerprints.
 """
 
-from re import sub
+import atexit
 import sys
-import pty
-from dataclasses import dataclass
-from textwrap import dedent
-from pprint import pformat
 from copy import deepcopy
+from dataclasses import dataclass
+from datetime import datetime
+from textwrap import dedent, indent
+from pprint import pformat
+from traceback import format_stack
 from typing import List, Tuple
+from io import StringIO
 
+from minineedle import NeedlemanWunsch, ScoreMatrix
+from minineedle.core import Gap
 from prompt_toolkit import Application
-from prompt_toolkit.enums import EditingMode
 from prompt_toolkit.buffer import Buffer
+from prompt_toolkit.enums import EditingMode
 from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.layout import Layout
 from prompt_toolkit.layout.containers import HSplit, VSplit, Window, WindowAlign
 from prompt_toolkit.layout.controls import BufferControl, FormattedTextControl
-from prompt_toolkit.widgets import Frame, HorizontalLine, VerticalLine
+from prompt_toolkit.widgets import Frame, HorizontalLine
+from rich.console import Console
+from strip_ansi import strip_ansi
 
 from gnize import dotdir, features
 
-import IPython
-
-from minineedle import NeedlemanWunsch, ScoreMatrix
-from minineedle.core import Gap
-from rich.console import Console
 
 @dataclass
 class Interval:
-    "a subintval of the given noise (might be a subcanvas, might be a gap)"
+    "a subinterval of the given noise (might be a subcanvas, might be a gap)"
 
     start: int
     end: int
@@ -127,91 +128,87 @@ class Interval:
 
         return prefix + f"{start}{connector}{end}"
 
+def align_and_fix(signal, noise) -> Tuple[List[Interval], List[Interval], str]:
 
-def align_and_fix(_signal, _noise) -> Tuple[List[Interval], List[Interval], str]:
-
-    signal = deepcopy(_signal)
-    noise = deepcopy(_noise)
+    debug(f"align and fix:\n{signal}\n{noise}")
 
     def align() -> List[Tuple]:
 
-        pair = NeedlemanWunsch(noise, signal)
+        pair = NeedlemanWunsch(signal, noise)
         pair.smatrix = ScoreMatrix(match=1, miss=0, gap=-1)
         pair.align()
-        c, s = pair.get_aligned_sequences()
-        return list(zip(c, s))
+        s, n = pair.get_aligned_sequences()
+        alignment = list(zip(s, n))
+        debug(alignment)
+        return alignment
 
-    # overwrite transcription errors with values from canvas
-    c_idx = -1
-    s_idx = -1
-    for c, s in align():
-        if type(c) is Gap:
-            # no data inssertion allowed at this step
-            # overwrite signal from canvas at this location
-            # this means that editor actions that would create new data
-            # can only widen the signal
-            signal[s_idx] = c
-        else:
-            c_idx += 1
+    def gapf(text):
+        console = Console(force_terminal=True, color_system="truecolor")
+        with console.capture() as capture:
+            console.print(f"[strike]{text}[/strike]", end="")
+            #console.print(f"[strike]{text}[/strike]", style=config.colors.gaps.secondary, end="")
+        return capture.get()
+#
+#    def signalf(text):
+#        console = Console()
+#        with console.capture() as capture:
+#            console.print(text, end="")
+#            #console.print(text, style=config.colors.signals.secondary, end="")
+#        return capture.get()
 
-        if type(s) is Gap:
-            # signal is allowed to be less than canvas, do nothing
-            # this lets editor actions that would delete data work as expected
-            pass
-        else:
-            s_idx += 1
-
+    buffer_is_signal = False
+    buffer = ""
     signals = []
     gaps = []
-    outer_buffer = ""
-    buffer = ""
-    buffer_is_signal = False
+    fixed = ""
+    i = 0
+    for i, (s, n) in enumerate(align()):
 
-    def struck(text):
-        console = Console()
-        with console.capture() as capture:
-            console.print(f"[strike]{text}[/strike]", end='')
-        return capture.get()
-
-    # categorize characters on signal/gap transition
-    for i, (c, s) in enumerate(align()):
-
-        # first past should have eliminated any additions
-        if type(c) is Gap:
-            raise ValueError("signal char {s}(#{s_idx}) cannot be aligned to canvas")
-
-        # interpret deletions as gaps
-        if type(s) is Gap:
+        # if it's a match or an addition, consider it to be signal
+        if type(n) == type(s) == str:
             if buffer_is_signal:
-                signals.append(Interval(i - len(buffer), i, buffer))
-                outer_buffer += buffer
-                buffer = c
-                buffer_is_signal = False
+                buffer += n
             else:
-                buffer += c
-        else:
-            if not buffer_is_signal:
                 gaps.append(Interval(i - len(buffer), i, buffer))
-                outer_buffer += struck(buffer)
-                buffer = s
+                fixed += gapf(buffer)
+                #fixed += buffer
                 buffer_is_signal = True
-            else:
-                buffer += s
+                buffer = n
 
-    # capture remaining characters
+        # if it's noise without a signal, consider it to be a gap
+        elif type(s) is Gap:
+            if not buffer_is_signal:
+                buffer += n
+            else:
+                signals.append(Interval(i - len(buffer), i, buffer))
+                #fixed += signalf(buffer)
+                fixed += buffer
+                buffer_is_signal = False
+                buffer = n
+
+        else:
+            raise Exception(f"alignment issue at {i}: {s}, {n}")
+
+    # no more transitions, stash whatever is in the buffer
     if buffer_is_signal:
         signals.append(Interval(i - len(buffer), i, buffer))
-        outer_buffer += buffer
+        #fixed += signalf(buffer)
+        fixed += buffer
     else:
         gaps.append(Interval(i - len(buffer), i, buffer))
-        outer_buffer += struck(buffer)
+        fixed += gapf(buffer)
+        #fixed += buffer
 
-
-    return signals, gaps, outer_buffer
-
+    return signals, gaps, fixed
 
 subcanvasses = []
+subcanvasses_display = FormattedTextControl(text="")
 gaps = []
+gaps_display = FormattedTextControl(text="")
+debug_display = FormattedTextControl(text="")
+
+def strip_struck(text):
+    raise Exception("Not Implemented")
 
 
 def update(event):
@@ -221,7 +218,10 @@ def update(event):
     global gaps_display
     global debug_display
 
-    subcanvasses, gaps, fixed_buffer = align_and_fix(noise, buffer.text)
+    subcanvasses, gaps, fixed_buffer = align_and_fix(strip_struck(buffer.text), noise)
+
+    debug(buffer.text)
+    debug(fixed_buffer)
     buffer.text = fixed_buffer
 
     if event.selection_state:
@@ -275,6 +275,27 @@ legend_right = dedent(
 ).strip("\n")
 
 
+debug_file = None
+
+
+def close_debug_file():
+    if debug_file:
+        debug_file.close()
+
+def debug(message):
+    if debug_file:
+        if type(message) is not str:
+            debug_file.write("----\n")
+            debug_file.write(indent(pformat(message), "    "))
+            debug_file.write("\n")
+        else:
+            debug_file.write(dedent(message).strip() + "\n")
+        debug_file.flush()
+
+
+atexit.register(close_debug_file)
+
+
 noise = ""
 signal = ""
 buffer = Buffer(on_text_changed=update, on_cursor_position_changed=update)
@@ -283,14 +304,21 @@ buffer_header = FormattedTextControl(text="Delete noise until only signal remain
 subcanvasses_header = FormattedTextControl(text="Signal")
 gaps_header = FormattedTextControl(text="Noise")
 
-subcanvasses_display = FormattedTextControl(text="")
-gaps_display = FormattedTextControl(text="")
-debug_display = FormattedTextControl(text="")
-
 selected_idx = 0
 
-root_container = HSplit(
-    [
+root_container = None
+config = dotdir.make_or_get()
+
+
+def make_canvas(_noise, args):
+
+    global noise
+    global debug_file
+    global root_container
+
+    noise = _noise
+
+    ui = [
         VSplit(
             [
                 Frame(
@@ -304,7 +332,6 @@ root_container = HSplit(
                 Frame(title="Gaps", body=Window(width=10, content=gaps_display)),
             ]
         ),
-        HorizontalLine(),
         VSplit(
             [
                 Window(content=FormattedTextControl(text=legend_left)),
@@ -315,18 +342,15 @@ root_container = HSplit(
                 ),
             ]
         ),
-        HorizontalLine(),
-        Window(content=debug_display),
-        HorizontalLine(),
     ]
-)
 
+    if args.debug:
+        debug_file = open(config.runtime.debug_log, "w")
+        debug(f"cog started {datetime.now()}")
+        ui.append(HorizontalLine())
+        ui.append(Window(content=debug_display))
 
-def make_canvas(_noise):
-
-    global noise
-    noise = _noise
-    config = dotdir.make_or_get()
+    root_container = HSplit(ui)
 
     subcanvasses.append(Interval(start=0, end=len(noise) - 1, content=noise))
 

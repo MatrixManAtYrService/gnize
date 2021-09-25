@@ -34,15 +34,25 @@ class FingerprintStore:
     use: str
     connect: str
 
-default_gap_colors = ["#b58900", "#cb4b16"]
-default_signal_colors = ["#2aa198", "#6c71c4"]
+
+@dataclass_json
+@dataclass
+class Alternation:
+    primary: str
+    secondary: str
 
 
 @dataclass_json
 @dataclass
 class Colors:
-    gaps : list[str] = field(default_factory=lambda: default_gap_colors)
-    signals : list[str] = field(default_factory=lambda: default_signal_colors)
+    gaps: Alternation
+    signals: Alternation
+
+
+@dataclass_json
+@dataclass
+class Runtime:
+    debug_log: str
 
 
 @dataclass_json
@@ -52,6 +62,7 @@ class Config:
     canvasses: CanvasSource
     fingerprints: FingerprintStore
     colors: Colors
+    runtime: Runtime
 
 
 
@@ -61,8 +72,15 @@ default_config = from_dict(
     data={
         "editor": {"use": "prompttoolkit", "mode": "vi"},
         "canvasses": {"use": "filesystem", "path": str(dir_path / "canvasses")},
-        "fingerprints": {"use": "sqlite3", "connect": str(dir_path / "fingerprints.db")},
-        "colors": {"gaps": default_gap_colors, "signals": default_signal_colors}
+        "fingerprints": {
+            "use": "sqlite3",
+            "connect": str(dir_path / "fingerprints.db"),
+        },
+        "colors": {
+            "gaps": {"primary": "#b58900", "secondary": "#cb4b16"},
+            "signals": {"primary": "#2aa198", "secondary": "#6c71c4"},
+        },
+        "runtime": {"debug_log": "./.gnize.debug"},
     },
 )
 
@@ -98,6 +116,7 @@ def make_or_get():
             f.write(config_str)
         print(f"{config_path} already exists", file=sys.stderr)
         config = default_config
+
     except FileNotFoundError:
         with open(config_path, "r") as f:
             config_str = f.read()
@@ -113,7 +132,6 @@ def make_or_get():
             if multihash.is_valid(str(child)):
                 count += 1
         print(f"{count} canvasses found in f{canvas_dir}", file=sys.stderr)
-
 
     # fingerprints database
     if config.fingerprints.use == "sqlite3":
@@ -140,3 +158,5 @@ def make_or_get():
         cursor.execute("SELECT count(distinct canvas_hash) from prints;")
         count = cursor.fetchone()[0]
         print(f"{count} fingerprints cognized so far", file=sys.stderr)
+
+    return config
