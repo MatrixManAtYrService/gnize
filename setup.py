@@ -9,7 +9,7 @@ setup(
     author_email="gnize@matt.rixman.org",
     packages=["gnize"],
     python_requires=">=3.8",
-    install_requires=["pyfinite", "prompt_toolkit", "sortedcontainers", "pyyaml", "dataclasses_json", "dacite", "py-multihash", "miniseq", "minineedle", "rich", "strip_ansi"],
+    install_requires=["pyfinite", "prompt_toolkit", "sortedcontainers", "pyyaml", "dataclasses_json", "dacite", "py-multihash", "miniseq", "minineedle", "rich", "intervaltree"],
     entry_points={
         "console_scripts": [
             "gn = gnize.cli:gn",

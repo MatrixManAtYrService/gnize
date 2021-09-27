@@ -50,16 +50,15 @@ problem.  For now we just want create canvasses and query for them by fingerprin
 
 import atexit
 import sys
-from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime
 from textwrap import dedent, indent
 from pprint import pformat
-from traceback import format_stack
-from typing import List, Tuple
-from io import StringIO
+from enum import Enum, auto
 
-from minineedle import NeedlemanWunsch, ScoreMatrix
+from enum import Enum, auto
+from intervaltree import IntervalTree
+from minineedle import NeedlemanWunsch
 from minineedle.core import Gap
 from prompt_toolkit import Application
 from prompt_toolkit.buffer import Buffer
@@ -70,38 +69,36 @@ from prompt_toolkit.layout.containers import HSplit, VSplit, Window, WindowAlign
 from prompt_toolkit.layout.controls import BufferControl, FormattedTextControl
 from prompt_toolkit.widgets import Frame, HorizontalLine
 from rich.console import Console
-from strip_ansi import strip_ansi
 
 from gnize import dotdir, features
 
+class Kind(Enum):
+    "cognized noise is either..."
+
+    signal = auto() # user identified noise as signal
+    gap = auto()  # user identified noise as noise
+    error = auto()  # user modified noise, this is disallowed in cog
 
 @dataclass
-class Interval:
-    "a subinterval of the given noise (might be a subcanvas, might be a gap)"
+class Data:
+    "Each interval of noise refers to..."
 
-    start: int
-    end: int
-    content: str
+    kind: Kind
+    data: str
 
-    def inside(self, it):
-        return self.start < it < self.end
-
-    def outside(self, it):
-        return it < self.start or it > self.end
-
-    def summary(self, index, cursor_start=0, cursor_stop=None):
+    def summary(self, interval, index, cursor_start=0, cursor_stop=None):
 
         if cursor_stop is None:
-            if self.inside(cursor_start):
+            if cursor_start in interval:
                 prefix = "(*)"
             else:
                 prefix = None
         else:
-            if self.inside(cursor_start) and self.outside(cursor_stop):
+            if cursor_start in interval and cursor_stop > interval:
                 prefix = "(*>"
-            elif self.outside(cursor_start) and self.inside(cursor_stop):
+            elif cursor_start < interval and cursor_stop in interval:
                 prefix = "<*)"
-            elif self.inside(cursor_start) and self.inside(cursor_stop):
+            elif cursor_start in interval and cursor_stop in interval:
                 prefix = "(*)"
             else:
                 prefix = None
@@ -110,7 +107,7 @@ class Interval:
         if not prefix:
             prefix = f"{index}"
 
-        flat = " ".join(self.content.split())
+        flat = " ".join(self.data.split())
         width = len(flat)
         if width > 16:
             start = flat[:8]
@@ -128,88 +125,70 @@ class Interval:
 
         return prefix + f"{start}{connector}{end}"
 
-def align_and_fix(signal, noise) -> Tuple[List[Interval], List[Interval], str]:
+def find_gaps(signal: str, noise: str) -> IntervalTree:
+    """
+    Given noise found in the wild, and a signal identified in it by the user,
+    build an interval tree identifying which subsets of the noise align with
+    the signal.
+    """
 
-    debug(f"align and fix:\n{signal}\n{noise}")
+    class Mode(Enum):
+        match = auto()
+        signal_gap = auto()
+        noise_gap = auto()
 
-    def align() -> List[Tuple]:
+    intervals = IntervalTree()
+    a = NeedlemanWunsch(signal, noise)
+    a.align()
+    sig, noise = a.get_aligned_sequences()
 
-        pair = NeedlemanWunsch(signal, noise)
-        pair.smatrix = ScoreMatrix(match=1, miss=0, gap=-1)
-        pair.align()
-        s, n = pair.get_aligned_sequences()
-        alignment = list(zip(s, n))
-        debug(alignment)
-        return alignment
 
-    def gapf(text):
-        console = Console(force_terminal=True, color_system="truecolor")
-        with console.capture() as capture:
-            console.print(f"[strike]{text}[/strike]", end="")
-            #console.print(f"[strike]{text}[/strike]", style=config.colors.gaps.secondary, end="")
-        return capture.get()
-#
-#    def signalf(text):
-#        console = Console()
-#        with console.capture() as capture:
-#            console.print(text, end="")
-#            #console.print(text, style=config.colors.signals.secondary, end="")
-#        return capture.get()
+    def get_data(m):
+       if m == Mode.match:
+           string = sig[interval_start: i]
+           kind = Kind.signal
+       elif m == Mode.signal_gap:
+           string = noise[interval_start: i]
+           kind = Kind.gap
+       elif m == Mode.noise_gap:
+           string = sig[interval_start: i]
+           kind = Kind.error
+       else:
+           raise Exception(f"unexpected mode: {oldmode}")
+       return Data(kind, "".join(string))
 
-    buffer_is_signal = False
-    buffer = ""
-    signals = []
-    gaps = []
-    fixed = ""
+    mode = None
+    interval_start = 0
     i = 0
-    for i, (s, n) in enumerate(align()):
+    for i in range(len(noise)):
+       n, s = noise[i], sig[i]
+       oldmode = mode
+       if type(n) is Gap:
+           mode = Mode.noise_gap
+       elif type(s) is Gap:
+           mode = Mode.signal_gap
+       elif type(n) == type(s) == str:
+          mode = Mode.match
+       else:
+           raise Exception(f"alignment issue at idx:{i} noise:{n}, signal:{s}")
+       if (not oldmode) or (oldmode == mode):
+           continue
+       else:
+           data = get_data(oldmode)
+           intervals[interval_start: i] = data
+           interval_start = i
 
-        # if it's a match or an addition, consider it to be signal
-        if type(n) == type(s) == str:
-            if buffer_is_signal:
-                buffer += n
-            else:
-                gaps.append(Interval(i - len(buffer), i, buffer))
-                fixed += gapf(buffer)
-                #fixed += buffer
-                buffer_is_signal = True
-                buffer = n
+    #data = get_data(mode)
+    #intervals[interval_start: i] = data
 
-        # if it's noise without a signal, consider it to be a gap
-        elif type(s) is Gap:
-            if not buffer_is_signal:
-                buffer += n
-            else:
-                signals.append(Interval(i - len(buffer), i, buffer))
-                #fixed += signalf(buffer)
-                fixed += buffer
-                buffer_is_signal = False
-                buffer = n
+    return intervals
 
-        else:
-            raise Exception(f"alignment issue at {i}: {s}, {n}")
-
-    # no more transitions, stash whatever is in the buffer
-    if buffer_is_signal:
-        signals.append(Interval(i - len(buffer), i, buffer))
-        #fixed += signalf(buffer)
-        fixed += buffer
-    else:
-        gaps.append(Interval(i - len(buffer), i, buffer))
-        fixed += gapf(buffer)
-        #fixed += buffer
-
-    return signals, gaps, fixed
 
 subcanvasses = []
 subcanvasses_display = FormattedTextControl(text="")
 gaps = []
 gaps_display = FormattedTextControl(text="")
 debug_display = FormattedTextControl(text="")
-
-def strip_struck(text):
-    raise Exception("Not Implemented")
-
 
 def update(event):
     global subcanvasses
@@ -218,11 +197,26 @@ def update(event):
     global gaps_display
     global debug_display
 
-    subcanvasses, gaps, fixed_buffer = align_and_fix(strip_struck(buffer.text), noise)
+    # align edits to noise
+    intervals = sorted(find_gaps(buffer.text, noise))
+    debug(intervals)
 
-    debug(buffer.text)
-    debug(fixed_buffer)
-    buffer.text = fixed_buffer
+    # show user recent changes
+    subcanvasses = []
+    gaps = []
+    new_text = ""
+    for interval in intervals:
+        if interval.data.kind is Kind.error:
+            raise Exception("Not Implemented")
+        elif interval.data.kind is Kind.signal:
+            subcanvasses.append(interval)
+            new_text += interval.data.data
+        elif interval.data.kind is Kind.gap:
+            gaps.append(interval)
+            new_text += interval.data.data
+            # todo: formatting
+    debug(new_text)
+    buffer.text = new_text
 
     if event.selection_state:
         selected_from = min(
@@ -248,7 +242,7 @@ def update(event):
 def render(interval_list, interval_display, cursor_start, cursor_stop=None):
     interval_display.text = "\n".join(
         [
-            x.summary(i, cursor_start, cursor_stop=cursor_stop)
+            x.data.summary(x, i, cursor_start, cursor_stop=cursor_stop)
             for i, x in enumerate(interval_list)
         ]
     )
@@ -352,7 +346,7 @@ def make_canvas(_noise, args):
 
     root_container = HSplit(ui)
 
-    subcanvasses.append(Interval(start=0, end=len(noise) - 1, content=noise))
+    subcanvasses.append(Data(Kind.signal, noise))
 
     # start with the input noise as the signal
     buffer.text = noise
@@ -368,3 +362,5 @@ def make_canvas(_noise, args):
     Application(
         key_bindings=kb, layout=Layout(root_container), editing_mode=EditingMode.VI
     ).run()
+
+
