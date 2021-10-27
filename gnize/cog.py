@@ -80,6 +80,11 @@ class Kind(Enum):
     error = auto()  # user modified noise, this is disallowed in cog
 
 @dataclass
+class Error:
+    signal: str
+    noise: str
+
+@dataclass
 class Data:
     "Each interval of noise refers to..."
 
@@ -134,6 +139,7 @@ def find_gaps(signal: str, noise: str) -> IntervalTree:
 
     class Mode(Enum):
         match = auto()
+        error = auto()
         signal_gap = auto()
         noise_gap = auto()
 
@@ -143,7 +149,7 @@ def find_gaps(signal: str, noise: str) -> IntervalTree:
     sig, noise = a.get_aligned_sequences()
 
 
-    def get_data(m):
+    def get_data(m, i):
        if m == Mode.match:
            string = sig[interval_start: i]
            kind = Kind.signal
@@ -152,6 +158,9 @@ def find_gaps(signal: str, noise: str) -> IntervalTree:
            kind = Kind.gap
        elif m == Mode.noise_gap:
            string = sig[interval_start: i]
+           kind = Kind.error
+       elif m == Mode.error:
+           string = noise[interval_start: i]
            kind = Kind.error
        else:
            raise Exception(f"unexpected mode: {oldmode}")
@@ -168,18 +177,22 @@ def find_gaps(signal: str, noise: str) -> IntervalTree:
        elif type(s) is Gap:
            mode = Mode.signal_gap
        elif type(n) == type(s) == str:
-          mode = Mode.match
+           if n == s:
+               mode = Mode.match
+           else:
+               mode = Mode.error
        else:
            raise Exception(f"alignment issue at idx:{i} noise:{n}, signal:{s}")
        if (not oldmode) or (oldmode == mode):
            continue
        else:
-           data = get_data(oldmode)
+           data = get_data(oldmode, i)
            intervals[interval_start: i] = data
            interval_start = i
 
-    #data = get_data(mode)
-    #intervals[interval_start: i] = data
+
+    data = get_data(mode, i + 1)
+    intervals[interval_start: i + 1] = data
 
     return intervals
 
