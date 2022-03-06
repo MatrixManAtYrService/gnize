@@ -52,14 +52,14 @@ import atexit
 import sys
 from dataclasses import dataclass
 from datetime import datetime
-from textwrap import dedent, indent
+from enum import Enum, auto
 from pprint import pformat
-from enum import Enum, auto
+from textwrap import dedent, indent
+from typing import List, Union, Tuple
 
-from enum import Enum, auto
-from intervaltree import IntervalTree
-from minineedle import NeedlemanWunsch
+from intervaltree import Interval, IntervalTree
 from minineedle.core import Gap
+from minineedle.needle import NeedlemanWunsch
 from prompt_toolkit import Application
 from prompt_toolkit.buffer import Buffer
 from prompt_toolkit.enums import EditingMode
@@ -72,24 +72,27 @@ from rich.console import Console
 
 from gnize import dotdir, features
 
+
 class Kind(Enum):
     "cognized noise is either..."
 
-    signal = auto() # user identified noise as signal
+    signal = auto()  # user identified noise as signal
     gap = auto()  # user identified noise as noise
     error = auto()  # user modified noise, this is disallowed in cog
+
 
 @dataclass
 class Error:
     signal: str
     noise: str
 
+
 @dataclass
 class Data:
     "Each interval of noise refers to..."
 
     kind: Kind
-    data: str
+    data: Union[str, Tuple[str, str]]
 
     def summary(self, interval, index, cursor_start=0, cursor_stop=None):
 
@@ -130,11 +133,21 @@ class Data:
 
         return prefix + f"{start}{connector}{end}"
 
+
+@dataclass
+class Error:
+    original: str
+    user_change: str
+
+
 def find_gaps(signal: str, noise: str) -> IntervalTree:
     """
-    Given noise found in the wild, and a signal identified in it by the user,
-    build an interval tree identifying which subsets of the noise align with
-    the signal.
+    Given noise found in the wild, and a signal identified in it by
+    the user, build an interval tree identifying which subsets of the
+    noise align with the signal.
+
+    If the user has made edits, mark them as errors and include the
+    erroneous data in that location.
     """
 
     class Mode(Enum):
@@ -148,53 +161,87 @@ def find_gaps(signal: str, noise: str) -> IntervalTree:
     a.align()
     sig, noise = a.get_aligned_sequences()
 
+    def get_data(m, i) -> Data:
+        "create a Date object for this interval based how it (mis)aligns"
 
-    def get_data(m, i):
-       if m == Mode.match:
-           string = sig[interval_start: i]
-           kind = Kind.signal
-       elif m == Mode.signal_gap:
-           string = noise[interval_start: i]
-           kind = Kind.gap
-       elif m == Mode.noise_gap:
-           string = sig[interval_start: i]
-           kind = Kind.error
-       elif m == Mode.error:
-           string = noise[interval_start: i]
-           kind = Kind.error
-       else:
-           raise Exception(f"unexpected mode: {oldmode}")
-       return Data(kind, "".join(string))
+        def s(the_str, i):
+            "extract the indicated sequence as a string"
+            return "".join(the_str[interval_start:i])
+
+        if m == Mode.match:
+            data = s(sig, i)
+            kind = Kind.signal
+        elif m == Mode.signal_gap:
+            data = s(noise, i)
+            kind = Kind.gap
+        elif m == Mode.noise_gap:
+            data = s(sig, i)
+            kind = Kind.error
+        elif m == Mode.error:
+            data = Error(s(noise, i), s(signal, i))
+            kind = Kind.error
+        else:
+            raise Exception(f"unexpected mode: {oldmode}")
+        return Data(kind, data)
 
     mode = None
     interval_start = 0
     i = 0
     for i in range(len(noise)):
-       n, s = noise[i], sig[i]
-       oldmode = mode
-       if type(n) is Gap:
-           mode = Mode.noise_gap
-       elif type(s) is Gap:
-           mode = Mode.signal_gap
-       elif type(n) == type(s) == str:
-           if n == s:
-               mode = Mode.match
-           else:
-               mode = Mode.error
-       else:
-           raise Exception(f"alignment issue at idx:{i} noise:{n}, signal:{s}")
-       if (not oldmode) or (oldmode == mode):
-           continue
-       else:
-           data = get_data(oldmode, i)
-           intervals[interval_start: i] = data
-           interval_start = i
-
+        n, s = noise[i], sig[i]
+        oldmode = mode
+        if type(n) is Gap:
+            mode = Mode.noise_gap
+        elif type(s) is Gap:
+            mode = Mode.signal_gap
+        elif type(n) == type(s) == str:
+            if n == s:
+                mode = Mode.match
+            else:
+                mode = Mode.error
+        else:
+            raise Exception(f"alignment issue at idx:{i} noise:{n}, signal:{s}")
+        if (not oldmode) or (oldmode == mode):
+            continue
+        else:
+            data = get_data(oldmode, i)
+            intervals[interval_start:i] = data
+            interval_start = i
 
     data = get_data(mode, i + 1)
-    intervals[interval_start: i + 1] = data
+    intervals[interval_start : i + 1] = data
 
     return intervals
+
+
+@dataclass
+class InterpretedEdit:
+    begin: int
+    end: int
+    injected: str
+    corrected: str
+
+
+def remove_transpositions(sig_noise: IntervalTree, noise: str) -> List[InterpretedEdit]:
+    """
+    Deleting a character means "this is noise", adding one means
+    "there is signal here".  It does NOT mean that the newly added
+    character is that signal, the signal has to come out of the
+    noise.
+
+    We handle this by replacing the addition/transposition with
+    data from the noise.  Mutates the given intervaltree, returns
+    a list the mutations made.
+    """
+
+    changes = []
+    for it in sig_noise.items():
+        if it.data.kind == Kind.error:
+            fixed = Data(Kind.signal, noise[it.begin : it.end])
+            sig_noise[it.begin : it.end] = fixed
+            changes.append(InterpretedEdit(it.begin, it.end, it.data.data, fixed.data))
+
+    return changes
 
 
 subcanvasses = []
@@ -203,6 +250,7 @@ gaps = []
 gaps_display = FormattedTextControl(text="")
 debug_display = FormattedTextControl(text="")
 
+
 def update(event):
     global subcanvasses
     global subcanvasses_display
@@ -210,8 +258,10 @@ def update(event):
     global gaps_display
     global debug_display
 
-    # align edits to noise
-    intervals = sorted(find_gaps(buffer.text, noise))
+    # align signal to noise
+    sig_noise = find_gaps(buffer.text, noise)
+    remove_transpositions(sig_noise, noise)
+    intervals = sorted(sig_noise)
     debug(intervals)
 
     # show user recent changes
@@ -220,7 +270,7 @@ def update(event):
     new_text = ""
     for interval in intervals:
         if interval.data.kind is Kind.error:
-            raise Exception("Not Implemented")
+            raise Exception("cog doesn't edit, ")
         elif interval.data.kind is Kind.signal:
             subcanvasses.append(interval)
             new_text += interval.data.data
@@ -288,6 +338,7 @@ debug_file = None
 def close_debug_file():
     if debug_file:
         debug_file.close()
+
 
 def debug(message):
     if debug_file:
@@ -375,5 +426,3 @@ def make_canvas(_noise, args):
     Application(
         key_bindings=kb, layout=Layout(root_container), editing_mode=EditingMode.VI
     ).run()
-
-
