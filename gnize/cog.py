@@ -82,12 +82,6 @@ class Kind(Enum):
 
 
 @dataclass
-class Error:
-    signal: str
-    noise: str
-
-
-@dataclass
 class Data:
     "Each interval of noise refers to..."
 
@@ -139,6 +133,12 @@ class Error:
     original: str
     user_change: str
 
+    def __hash__(self):
+        return (self.original + self.user_change).__hash__()
+
+    def __lt__(self, other):
+        return (self.original + self.user_change) < other
+
 
 def find_gaps(signal: str, noise: str) -> IntervalTree:
     """
@@ -161,12 +161,21 @@ def find_gaps(signal: str, noise: str) -> IntervalTree:
     a.align()
     sig, noise = a.get_aligned_sequences()
 
-    def get_data(m, i) -> Data:
-        "create a Date object for this interval based how it (mis)aligns"
+    def get_data(m, i, sig_noise) -> Data:
+        "create a Data object for this interval based how it (mis)aligns"
+
+
 
         def s(the_str, i):
             "extract the indicated sequence as a string"
             return "".join(the_str[interval_start:i])
+        
+        try:
+            print("params:", m, i)
+            print("signal:", s(noise, i))
+            print("noise:", s(signal, i))
+        except:
+            pass
 
         if m == Mode.match:
             data = s(sig, i)
@@ -175,10 +184,11 @@ def find_gaps(signal: str, noise: str) -> IntervalTree:
             data = s(noise, i)
             kind = Kind.gap
         elif m == Mode.noise_gap:
-            data = s(sig, i)
+            data = Error("", s(sig, i))
             kind = Kind.error
         elif m == Mode.error:
-            data = Error(s(noise, i), s(signal, i))
+            data = Error(s(noise, i), s(sig, i))
+            print("ERROR:", data)
             kind = Kind.error
         else:
             raise Exception(f"unexpected mode: {oldmode}")
@@ -187,7 +197,9 @@ def find_gaps(signal: str, noise: str) -> IntervalTree:
     mode = None
     interval_start = 0
     i = 0
+
     for i in range(len(noise)):
+
         n, s = noise[i], sig[i]
         oldmode = mode
         if type(n) is Gap:
@@ -201,14 +213,16 @@ def find_gaps(signal: str, noise: str) -> IntervalTree:
                 mode = Mode.error
         else:
             raise Exception(f"alignment issue at idx:{i} noise:{n}, signal:{s}")
+
+        print("mode:", mode, n, s)
         if (not oldmode) or (oldmode == mode):
             continue
         else:
-            data = get_data(oldmode, i)
+            data = get_data(oldmode, i, (s, n))
             intervals[interval_start:i] = data
             interval_start = i
 
-    data = get_data(mode, i + 1)
+    data = get_data(mode, i + 1, (s, n))
     intervals[interval_start : i + 1] = data
 
     return intervals
