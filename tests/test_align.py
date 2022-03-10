@@ -193,8 +193,53 @@ def test_align_ambig_2():
         noise,
         OrderedDict(
             {
-                Error(original="", user_change="a"): Kind.error,
-                Error(original="x", user_change="b"): Kind.error,
+                Error(original="x", user_change="ab"): Kind.error,
+            }
+        ),
+    )
+
+def test_err_mult():
+    noise = "aaabbb"
+    signal = "aaxxxbb"
+    it = find_gaps(signal, noise)
+    walk_asserts(
+        it,
+        noise,
+        OrderedDict(
+            {
+                "aa": Kind.signal,
+                Error(original="ab", user_change="xxx"): Kind.error,
+                "bb": Kind.signal,
+            }
+        ),
+    )
+
+def test_gap_mult():
+    noise = "aaabbb"
+    signal = "aabb"
+    it = find_gaps(signal, noise)
+# TODO: fiddle with weights so that scattered gaps are
+# discouraged and continuous gaps preferred
+#    walk_asserts(
+#        it,
+#        noise,
+#        OrderedDict(
+#            {
+#                "aa": Kind.signal,
+#                "ab": Kind.gap,
+#                "bb": Kind.signal,
+#            }
+#        ),
+#    )
+    walk_asserts(
+        it,
+        noise,
+        OrderedDict(
+            {
+                "a": Kind.gap,
+                "aa": Kind.signal,
+                "b": Kind.gap,
+                "bb": Kind.signal,
             }
         ),
     )

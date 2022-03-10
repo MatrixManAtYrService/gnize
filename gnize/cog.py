@@ -165,11 +165,11 @@ def find_gaps(signal: str, noise: str) -> IntervalTree:
         "create a Data object for this interval based how it (mis)aligns"
 
 
-
         def s(the_str, i):
             "extract the indicated sequence as a string"
-            return "".join(the_str[interval_start:i])
-        
+            return "".join(map(lambda x: x if type(x) == str else "",
+                               the_str[interval_start:i]))
+
         try:
             print("params:", m, i)
             print("signal:", s(noise, i))
@@ -203,7 +203,7 @@ def find_gaps(signal: str, noise: str) -> IntervalTree:
         n, s = noise[i], sig[i]
         oldmode = mode
         if type(n) is Gap:
-            mode = Mode.noise_gap
+            mode = Mode.error
         elif type(s) is Gap:
             mode = Mode.signal_gap
         elif type(n) == type(s) == str:
