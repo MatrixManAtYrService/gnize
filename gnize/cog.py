@@ -55,7 +55,7 @@ from datetime import datetime
 from enum import Enum, auto
 from pprint import pformat
 from textwrap import dedent, indent
-from typing import List, Union, Tuple
+from typing import Dict, Union, Tuple
 
 from intervaltree import Interval, IntervalTree
 from minineedle.core import Gap
@@ -164,18 +164,18 @@ def find_gaps(signal: str, noise: str) -> IntervalTree:
     def get_data(m, i, sig_noise) -> Data:
         "create a Data object for this interval based how it (mis)aligns"
 
-
         def s(the_str, i):
             "extract the indicated sequence as a string"
-            return "".join(map(lambda x: x if type(x) == str else "",
-                               the_str[interval_start:i]))
+            return "".join(
+                map(lambda x: x if type(x) == str else "", the_str[interval_start:i])
+            )
 
-        try:
-            print("params:", m, i)
-            print("signal:", s(noise, i))
-            print("noise:", s(signal, i))
-        except:
-            pass
+        # try:
+        #     print("params:", m, i)
+        #     print("signal:", s(noise, i))
+        #     print("noise:", s(signal, i))
+        # except:
+        #     pass
 
         if m == Mode.match:
             data = s(sig, i)
@@ -188,7 +188,7 @@ def find_gaps(signal: str, noise: str) -> IntervalTree:
             kind = Kind.error
         elif m == Mode.error:
             data = Error(s(noise, i), s(sig, i))
-            print("ERROR:", data)
+            # print("ERROR:", data)
             kind = Kind.error
         else:
             raise Exception(f"unexpected mode: {oldmode}")
@@ -214,7 +214,7 @@ def find_gaps(signal: str, noise: str) -> IntervalTree:
         else:
             raise Exception(f"alignment issue at idx:{i} noise:{n}, signal:{s}")
 
-        print("mode:", mode, n, s)
+        # print("mode:", mode, n, s)
         if (not oldmode) or (oldmode == mode):
             continue
         else:
@@ -228,32 +228,121 @@ def find_gaps(signal: str, noise: str) -> IntervalTree:
     return intervals
 
 
-@dataclass
-class InterpretedEdit:
-    begin: int
-    end: int
-    injected: str
-    corrected: str
+class EditStrategy(Enum):
 
+    # interim state while determining the strategy
+    pending = auto()
 
-def remove_transpositions(sig_noise: IntervalTree, noise: str) -> List[InterpretedEdit]:
+    # user transposition in the midst of a signal, delete it and merge neighbors
+    ignore = auto()
+
+    # user transposition at a signal boundary, extend signal to include it
+    extend_signal = auto()
+
+    # user transposition within a gap, just turn it into a signal
+    standalone_signal = auto()
+
+def reconcile(sig_noise: IntervalTree) -> Dict[int, EditStrategy]:
     """
     Deleting a character means "this is noise", adding one means
     "there is signal here".  It does NOT mean that the newly added
     character is that signal, the signal has to come out of the
-    noise.
+    noise.  Adding annotations to signals is a separate process.
 
     We handle this by replacing the addition/transposition with
-    data from the noise.  Mutates the given intervaltree, returns
-    a list the mutations made.
+    data from the noise.
+
+    This function Mutates the given intervaltree and returns a dict
+    showing which mutations were made where.
     """
 
-    changes = []
-    for it in sig_noise.items():
-        if it.data.kind == Kind.error:
-            fixed = Data(Kind.signal, noise[it.begin : it.end])
-            sig_noise[it.begin : it.end] = fixed
-            changes.append(InterpretedEdit(it.begin, it.end, it.data.data, fixed.data))
+    changes = {}
+
+    errors = list(filter(lambda x: x.data.kind == Kind.error, sig_noise.items()))
+
+    for error_interval in errors:
+
+        # what is before the error?
+        try:
+            predecessor = sig_noise[error_interval.begin - 1].pop()
+            p_length = predecessor.end - predecessor.begin
+        except KeyError:
+            predecessor = None
+
+        # what is after the error?
+        try:
+            successor = sig_noise[error_interval.end].pop()
+            s_length = successor.end - successor.begin
+        except KeyError:
+            successor = None
+
+
+        # whatever the case, remove the transposition
+        sig_noise.remove(error_interval)
+
+        # and place whatever was transposed from
+        data = error_interval.data.data.original
+        bad_data = error_interval.data.data.user_change
+
+        # if there's nothing to add, the strategy is "ignore"
+        if not data:
+            strategy = EditStrategy.ignore
+        else:
+            strategy = EditStrategy.pending
+
+        begin = error_interval.begin
+        end = error_interval.end
+        def consume_left(begin, data, strategy):
+            # if predecessor is a signal, expand it
+            if predecessor and predecessor.data.kind == Kind.signal:
+                sig_noise.remove(predecessor)
+                if strategy == EditStrategy.pending:
+                    strategy = EditStrategy.extend_signal
+                data = predecessor.data.data + data
+                begin = predecessor.begin
+            return begin, data, strategy
+
+        def consume_right(end, data, strategy):
+            # if successor is a signal, expand it
+            if successor and successor.data.kind == Kind.signal:
+                sig_noise.remove(successor)
+                if strategy == EditStrategy.pending:
+                    strategy = EditStrategy.extend_signal
+                data = data + successor.data.data
+                end = successor.end
+            return end, data, strategy
+
+        # uppercase (or otherwise shifted) insertions prefer larger signals to the left
+        if bad_data[0] in r'~!@#$%^&*()_+QWERTYUIOP{}|ASDFGHJKL:"ZXCVBNM<>?':
+            begin, data, strategy = consume_left(begin, data, strategy)
+            end, data, strategy = consume_right(end, data, strategy)
+
+        # otherwise, prefer larger signals on the right
+        else:
+            end, data, strategy = consume_right(end, data, strategy)
+            begin, data, strategy = consume_left(begin, data, strategy)
+
+
+        sig_noise.add(
+            Interval(
+                begin,
+                end,
+                Data(
+                    kind=Kind.signal,
+                    data=data
+                ),
+            )
+        )
+
+        if strategy == EditStrategy.pending:
+            # no signal on either side, and transposition-original is nonempty
+            # the previous addition must've added a standalone signal
+            # either between gaps, or between a gap and the beginning/end
+            # of the noise
+            strategy = EditStrategy.standalone_signal
+
+
+        changes[error_interval.begin] = strategy
 
     return changes
 

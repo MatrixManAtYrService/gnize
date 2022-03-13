@@ -40,7 +40,6 @@ def walk_asserts(it, noise, assert_dict):
         else:
             assert_len = len(assert_str)
 
-
         # consume noise
         actual_str = "".join(islice(noise_iter, assert_len))
         if not actual_str:
@@ -60,7 +59,6 @@ def walk_asserts(it, noise, assert_dict):
             print("no more intervals")
             interval_consumed = False
 
-
         # summarize step
         print("assert:", assert_str, "actual:", current_interval)
 
@@ -74,11 +72,12 @@ def walk_asserts(it, noise, assert_dict):
             print("leftover interval", current_interval)
             raise Exception("More intervals than asserts")
 
-
         # make assertions
         if type(assert_str) == Error:
             if type(current_interval.data) != Error:
-                raise AssertionError(f"Expected error {assert_str}, got {current_interval.data}")
+                raise AssertionError(
+                    f"Expected error {assert_str}, got {current_interval.data}"
+                )
 
             err_noise = current_interval.data.original
             err_signal = current_interval.data.user_change
@@ -87,7 +86,9 @@ def walk_asserts(it, noise, assert_dict):
             if assert_noise != err_noise:
                 raise AssertionError(f"Expected error {assert_noise}, got {err_noise}")
             if assert_signal != err_signal:
-                raise AssertionError(f"Expected error {assert_signal}, got {err_signal}")
+                raise AssertionError(
+                    f"Expected error {assert_signal}, got {err_signal}"
+                )
 
         elif actual_str != assert_str:
             raise AssertionError(f"Asserted about '{assert_str}', got '{actual_str}'")
@@ -134,6 +135,7 @@ def test_align_err():
             }
         ),
     )
+
 
 def test_align_err_gaponly():
     noise = "az"
@@ -184,6 +186,7 @@ def test_align_ambig_1():
         ),
     )
 
+
 def test_align_ambig_2():
     noise = "x"
     signal = "ab"
@@ -197,6 +200,7 @@ def test_align_ambig_2():
             }
         ),
     )
+
 
 def test_err_mult():
     noise = "aaabbb"
@@ -214,23 +218,24 @@ def test_err_mult():
         ),
     )
 
+
 def test_gap_mult():
     noise = "aaabbb"
     signal = "aabb"
     it = find_gaps(signal, noise)
-# TODO: fiddle with weights so that scattered gaps are
-# discouraged and continuous gaps preferred
-#    walk_asserts(
-#        it,
-#        noise,
-#        OrderedDict(
-#            {
-#                "aa": Kind.signal,
-#                "ab": Kind.gap,
-#                "bb": Kind.signal,
-#            }
-#        ),
-#    )
+    # TODO: fiddle with weights so that scattered gaps are
+    # discouraged and continuous gaps preferred
+    #    walk_asserts(
+    #        it,
+    #        noise,
+    #        OrderedDict(
+    #            {
+    #                "aa": Kind.signal,
+    #                "ab": Kind.gap,
+    #                "bb": Kind.signal,
+    #            }
+    #        ),
+    #    )
     walk_asserts(
         it,
         noise,

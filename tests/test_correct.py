@@ -1,30 +1,75 @@
 import pytest
-from gnize.cog import find_gaps, remove_transpositions
+from gnize.cog import find_gaps, reconcile, Error, Kind, EditStrategy
 from copy import deepcopy
 
 
-def get_data(i, it, predicate, relation_string):
-    orig = orig_it[i].pop()
-    fix = fixed_it[i].pop()
+def as_str(it):
+    k = {Kind.signal: "S", Kind.gap: "G", Kind.error: "E"}
+    s = ""
+    for interval in sorted(it.items(), key=lambda x: x.begin):
+        s += "{}({})".format(k[interval.data.kind], str(interval.data.data))
+        s += " "
+    print(s.strip())
+    return s.strip()
 
 
 def test_nofix():
     noise = "abcd"
     signal = "abcd"
-    orig_it = find_gaps(signal, noise)
-    fixed_it = orig_it.copy()
-    remove_transpositions(fixed_it, noise)
-    assert orig_it == fixed_it
+    it = find_gaps(signal, noise)
+    edits = reconcile(it)
+    assert as_str(it) == "S(abcd)"
+    assert edits == {}
 
 
-def test_fix_a():
+def test_strip_added():
     noise = "abcd"
-    signal = "abcx"
-    fixed = find_gaps(signal, noise)
-    removals = remove_transpositions(fixed, noise)
-    for i, _ in enumerate(signal[:-1]):
-        data = fixed[i].pop().data.data
-        assert data[i] == noise[i]
-    assert fixed[3].pop().data.data == "d"
-    assert removals[0].corrected == "d"
-    assert removals[0].injected == "d"
+    signal = "abxcd"
+    it = find_gaps(signal, noise)
+    edits = reconcile(it)
+    assert as_str(it) == "S(abcd)"
+    assert edits == {2: EditStrategy.ignore}
+
+
+def test_raw_transpose():
+    noise = "abcd"
+    signal = "axcd"
+    it = find_gaps(signal, noise)
+    print(it)
+    edits = reconcile(it)
+    assert as_str(it) == "S(abcd)"
+    assert edits == {1: EditStrategy.extend_signal}
+
+def test_transpose_gap_one():
+    noise = "abcdefg"
+    signal = "abcxg"
+    it = find_gaps(signal, noise)
+    edits = reconcile(it)
+    assert as_str(it) == "S(abc) G(de) S(fg)"
+    assert edits == {5: EditStrategy.extend_signal}
+
+def test_transpose_gap_two():
+    noise = "abcdefg"
+    signal = "abcxxg"
+    it = find_gaps(signal, noise)
+    edits = reconcile(it)
+    assert as_str(it) == "S(abc) G(d) S(efg)"
+    assert edits == {4: EditStrategy.extend_signal}
+
+def test_transpose_gap_two_left():
+    noise = "abcdefg"
+    signal = "abcXXg"
+    it = find_gaps(signal, noise)
+    edits = reconcile(it)
+    assert as_str(it) == "S(abcd) G(ef) S(g)"
+    assert edits == {3: EditStrategy.extend_signal}
+
+
+def test_transpose_gap_middle():
+    noise = "abcdefg"
+    signal = "axdxg"
+    it = find_gaps(signal, noise)
+    edits = reconcile(it)
+    assert as_str(it) == "S(a) G(b) S(cd) G(e) S(fg)"
+    print(edits)
+    assert edits == {2: EditStrategy.extend_signal, 5: EditStrategy.extend_signal}
