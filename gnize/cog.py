@@ -362,27 +362,27 @@ def update(event):
     global debug_display
 
     # align signal to noise
-    sig_noise = find_gaps(buffer.text, noise)
-    remove_transpositions(sig_noise, noise)
+    sig_noise = find_gaps(sig_only(buffer.text), noise)
+    edits = reconcile(sig_noise)
+    buffer.text = colored(sig_noise)
+
     intervals = sorted(sig_noise)
-    debug(intervals)
+    debug([intervals, edits])
+
 
     # show user recent changes
     subcanvasses = []
     gaps = []
-    new_text = ""
     for interval in intervals:
         if interval.data.kind is Kind.error:
             raise Exception("cog doesn't edit, ")
         elif interval.data.kind is Kind.signal:
             subcanvasses.append(interval)
-            new_text += interval.data.data
         elif interval.data.kind is Kind.gap:
             gaps.append(interval)
-            new_text += interval.data.data
-            # todo: formatting
-    debug(new_text)
-    buffer.text = new_text
+
+
+    debug(sig_only(buffer.text))
 
     if event.selection_state:
         selected_from = min(
@@ -404,6 +404,22 @@ def update(event):
         render(subcanvasses, subcanvasses_display, cursor_position)
         render(gaps, gaps_display, cursor_position)
 
+def colored(it):
+    out = []
+    for interval in sorted(it):
+        if interval.data.kind is Kind.gap:
+            out.append(interval.data.data.lower())
+        else:
+            out.append(interval.data.data.upper())
+    return ''.join(out)
+    # todo: actual colors
+
+def sig_only(data):
+    out = ""
+    for char in data:
+        if char.isupper():
+            out = out + char
+    return out
 
 def render(interval_list, interval_display, cursor_start, cursor_stop=None):
     interval_display.text = "\n".join(

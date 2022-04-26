@@ -1,5 +1,5 @@
 import pytest
-from gnize.cog import find_gaps, reconcile, Error, Kind, EditStrategy
+from gnize.cog import find_gaps, reconcile, colored, sig_only, Error, Kind, EditStrategy
 from copy import deepcopy
 
 
@@ -20,6 +20,8 @@ def test_nofix():
     edits = reconcile(it)
     assert as_str(it) == "S(abcd)"
     assert edits == {}
+    assert colored(it) == "ABCD"
+    assert sig_only(colored(it)) == "ABCD"
 
 
 def test_strip_added():
@@ -47,6 +49,8 @@ def test_transpose_gap_one():
     edits = reconcile(it)
     assert as_str(it) == "S(abc) G(de) S(fg)"
     assert edits == {5: EditStrategy.extend_signal}
+    assert colored(it) == "ABCdeFG"
+    assert sig_only(colored(it)) == "ABCFG"
 
 def test_transpose_gap_two():
     noise = "abcdefg"
@@ -55,14 +59,18 @@ def test_transpose_gap_two():
     edits = reconcile(it)
     assert as_str(it) == "S(abc) G(d) S(efg)"
     assert edits == {4: EditStrategy.extend_signal}
+    assert colored(it) == "ABCdEFG"
+    assert sig_only(colored(it)) == "ABCEFG"
 
 def test_transpose_gap_two_left():
     noise = "abcdefg"
     signal = "abcXXg"
     it = find_gaps(signal, noise)
     edits = reconcile(it)
-    assert as_str(it) == "S(abcd) G(ef) S(g)"
-    assert edits == {3: EditStrategy.extend_signal}
+    assert as_str(it) == "S(abc) G(d) S(efg)"
+    assert edits == {4: EditStrategy.extend_signal}
+    assert colored(it) == "ABCdEFG"
+    assert sig_only(colored(it)) == "ABCEFG"
 
 
 def test_transpose_gap_middle():
@@ -73,3 +81,5 @@ def test_transpose_gap_middle():
     assert as_str(it) == "S(a) G(b) S(cd) G(e) S(fg)"
     print(edits)
     assert edits == {2: EditStrategy.extend_signal, 5: EditStrategy.extend_signal}
+    assert colored(it) == "AbCDeFG"
+    assert sig_only(colored(it)) == "ACDFG"
