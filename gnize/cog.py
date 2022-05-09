@@ -55,11 +55,9 @@ from datetime import datetime
 from enum import Enum, auto
 from pprint import pformat
 from textwrap import dedent, indent
-from typing import Dict, Union, Tuple
+from typing import Union, Tuple, Iterator
 
 from intervaltree import Interval, IntervalTree
-from minineedle.core import Gap
-from minineedle.needle import NeedlemanWunsch
 from prompt_toolkit import Application
 from prompt_toolkit.buffer import Buffer
 from prompt_toolkit.enums import EditingMode
@@ -68,6 +66,7 @@ from prompt_toolkit.layout import Layout
 from prompt_toolkit.layout.containers import HSplit, VSplit, Window, WindowAlign
 from prompt_toolkit.layout.controls import BufferControl, FormattedTextControl
 from prompt_toolkit.widgets import Frame, HorizontalLine
+from prompt_toolkit.key_binding.vi_state import InputMode, ViState
 from rich.console import Console
 
 from gnize import dotdir, features
@@ -76,9 +75,9 @@ from gnize import dotdir, features
 class Kind(Enum):
     "cognized noise is either..."
 
-    signal = auto()  # user identified noise as signal
-    gap = auto()  # user identified noise as noise
-    error = auto()  # user modified noise, this is disallowed in cog
+    noise = auto()
+    signal = auto()
+    parameter = auto()
 
 
 @dataclass
@@ -88,20 +87,41 @@ class Data:
     kind: Kind
     data: Union[str, Tuple[str, str]]
 
-    def summary(self, interval, index, cursor_start=0, cursor_stop=None):
+    def summary(self, interval: Interval, index, cursor_start=0, cursor_stop=None):
+
+        def bounds(interval, pt):
+            if interval.begin == pt:
+                l = "["
+            elif interval.begin < pt:
+                l = "("
+            elif pt < interval.begin:
+                l = "<"
+            else:
+                l = ""
+
+            if interval.end == pt:
+                r = "]"
+            elif interval.end + 1 >= pt:
+                r = ")"
+            elif interval.end - 1 <= pt:
+                r = ">"
+            else:
+                r = ""
+
+            return (l, r)
+
+        ls, rs = bounds(interval, cursor_start)
+
 
         if cursor_stop is None:
-            if cursor_start in interval:
-                prefix = "(*)"
+            if interval.contains_point(cursor_start):
+                prefix = ls + "*" + rs
             else:
                 prefix = None
         else:
-            if cursor_start in interval and cursor_stop > interval:
-                prefix = "(*>"
-            elif cursor_start < interval and cursor_stop in interval:
-                prefix = "<*)"
-            elif cursor_start in interval and cursor_stop in interval:
-                prefix = "(*)"
+            if interval.contains_point(cursor_start) or interval.contains_point(cursor_stop):
+                le, re = bounds(interval, cursor_stop)
+                prefix = ls + "*" + re
             else:
                 prefix = None
 
@@ -125,6 +145,7 @@ class Data:
             end = ""
             connector = ""
 
+        debug(prefix + f"{start}{connector}{end}")
         return prefix + f"{start}{connector}{end}"
 
 
@@ -139,250 +160,120 @@ class Error:
     def __lt__(self, other):
         return (self.original + self.user_change) < other
 
-
-def find_gaps(signal: str, noise: str) -> IntervalTree:
+def find_targeted(orig: str, change: str) -> Tuple[Union[int, None], Union[int, None]]:
     """
-    Given noise found in the wild, and a signal identified in it by
-    the user, build an interval tree identifying which subsets of the
-    noise align with the signal.
-
-    If the user has made edits, mark them as errors and include the
-    erroneous data in that location.
+    Given two strings, the first being the original and the second
+    being whatever change the user applied, find the bounds of the
+    change.
     """
 
-    class Mode(Enum):
-        match = auto()
-        error = auto()
-        signal_gap = auto()
-        noise_gap = auto()
-
-    intervals = IntervalTree()
-    a = NeedlemanWunsch(signal, noise)
-    a.align()
-    sig, noise = a.get_aligned_sequences()
-
-    def get_data(m, i, sig_noise) -> Data:
-        "create a Data object for this interval based how it (mis)aligns"
-
-        def s(the_str, i):
-            "extract the indicated sequence as a string"
-            return "".join(
-                map(lambda x: x if type(x) == str else "", the_str[interval_start:i])
-            )
-
-        # try:
-        #     print("params:", m, i)
-        #     print("signal:", s(noise, i))
-        #     print("noise:", s(signal, i))
-        # except:
-        #     pass
-
-        if m == Mode.match:
-            data = s(sig, i)
-            kind = Kind.signal
-        elif m == Mode.signal_gap:
-            data = s(noise, i)
-            kind = Kind.gap
-        elif m == Mode.noise_gap:
-            data = Error("", s(sig, i))
-            kind = Kind.error
-        elif m == Mode.error:
-            data = Error(s(noise, i), s(sig, i))
-            # print("ERROR:", data)
-            kind = Kind.error
-        else:
-            raise Exception(f"unexpected mode: {oldmode}")
-        return Data(kind, data)
-
-    mode = None
-    interval_start = 0
-    i = 0
-
-    for i in range(len(noise)):
-
-        n, s = noise[i], sig[i]
-        oldmode = mode
-        if type(n) is Gap:
-            mode = Mode.error
-        elif type(s) is Gap:
-            mode = Mode.signal_gap
-        elif type(n) == type(s) == str:
-            if n == s:
-                mode = Mode.match
-            else:
-                mode = Mode.error
-        else:
-            raise Exception(f"alignment issue at idx:{i} noise:{n}, signal:{s}")
-
-        # print("mode:", mode, n, s)
-        if (not oldmode) or (oldmode == mode):
-            continue
-        else:
-            data = get_data(oldmode, i, (s, n))
-            intervals[interval_start:i] = data
-            interval_start = i
-
-    data = get_data(mode, i + 1, (s, n))
-    intervals[interval_start : i + 1] = data
-
-    return intervals
-
-
-class EditStrategy(Enum):
-
-    # interim state while determining the strategy
-    pending = auto()
-
-    # user transposition in the midst of a signal, delete it and merge neighbors
-    ignore = auto()
-
-    # user transposition at a signal boundary, extend signal to include it
-    extend_signal = auto()
-
-    # user transposition within a gap, just turn it into a signal
-    standalone_signal = auto()
-
-def reconcile(sig_noise: IntervalTree) -> Dict[int, EditStrategy]:
-    """
-    Deleting a character means "this is noise", adding one means
-    "there is signal here".  It does NOT mean that the newly added
-    character is that signal, the signal has to come out of the
-    noise.  Adding annotations to signals is a separate process.
-
-    We handle this by replacing the addition/transposition with
-    data from the noise.
-
-    This function Mutates the given intervaltree and returns a dict
-    showing which mutations were made where.
-    """
-
-    changes = {}
-
-    errors = list(filter(lambda x: x.data.kind == Kind.error, sig_noise.items()))
-
-    for error_interval in errors:
-
-        # what is before the error?
+    def find_mismatch(orig_iter: Iterator, change_iter: Iterator) -> Union[int, None]:
+        "walk the iterators and indicate where they produce different values"
+        i = 0
         try:
-            predecessor = sig_noise[error_interval.begin - 1].pop()
-            p_length = predecessor.end - predecessor.begin
-        except KeyError:
-            predecessor = None
+            while oc := next(orig_iter):
+                try:
+                    cc = next(change_iter)
+                except StopIteration:
+                    return i
+                if oc != cc:
+                    return i
+                else:
+                    i += 1
+        except StopIteration:
+            return None
+        return i or None
 
-        # what is after the error?
-        try:
-            successor = sig_noise[error_interval.end].pop()
-            s_length = successor.end - successor.begin
-        except KeyError:
-            successor = None
+    first_change = find_mismatch(iter(orig), iter(change))
+    if first_change != None and first_change >= len(orig):
+        first_change = None
+
+    from_back = find_mismatch(reversed(orig), reversed(change))
+    if from_back == None or from_back >= len(orig):
+        last_change = None
+    else:
+        last_change = len(orig) - from_back
+        if last_change >= len(orig):
+            last_change = None
+
+    debug(f"targeted from {first_change} to {last_change}")
+    return first_change, last_change
+
+def toggled(noise, _state, start, end):
+    "The user has indicated a range, change the state for those chars"
 
 
-        # whatever the case, remove the transposition
-        sig_noise.remove(error_interval)
+    if not _state:
+        # initialize al chars signal if no state is found
+        return [Kind.signal for _ in noise]
 
-        # and place whatever was transposed from
-        data = error_interval.data.data.original
-        bad_data = error_interval.data.data.user_change
+    if start == end or end == None:
+        return _state
+    debug(f"toggling, rage: {start}, {end}")
 
-        # if there's nothing to add, the strategy is "ignore"
-        if not data:
-            strategy = EditStrategy.ignore
+    sig = 0
+    noise = 0
+    for i in range(start, end):
+        if _state[i] in signal_kinds:
+            sig += 1
+        elif _state[i] in noise_kinds:
+            noise += 1
         else:
-            strategy = EditStrategy.pending
+            raise ValueError(f"What's {_state[i]}?")
 
-        begin = error_interval.begin
-        end = error_interval.end
-        def consume_left(begin, data, strategy):
-            # if predecessor is a signal, expand it
-            if predecessor and predecessor.data.kind == Kind.signal:
-                sig_noise.remove(predecessor)
-                if strategy == EditStrategy.pending:
-                    strategy = EditStrategy.extend_signal
-                data = predecessor.data.data + data
-                begin = predecessor.begin
-            return begin, data, strategy
+    prefix = _state[:start]
+    suffix = _state[end:]
+    if sig > noise:
+        target_state = Kind.noise
+    else:
+        target_state = Kind.signal
 
-        def consume_right(end, data, strategy):
-            # if successor is a signal, expand it
-            if successor and successor.data.kind == Kind.signal:
-                sig_noise.remove(successor)
-                if strategy == EditStrategy.pending:
-                    strategy = EditStrategy.extend_signal
-                data = data + successor.data.data
-                end = successor.end
-            return end, data, strategy
-
-        # uppercase (or otherwise shifted) insertions prefer larger signals to the left
-        if bad_data[0] in r'~!@#$%^&*()_+QWERTYUIOP{}|ASDFGHJKL:"ZXCVBNM<>?':
-            begin, data, strategy = consume_left(begin, data, strategy)
-            end, data, strategy = consume_right(end, data, strategy)
-
-        # otherwise, prefer larger signals on the right
-        else:
-            end, data, strategy = consume_right(end, data, strategy)
-            begin, data, strategy = consume_left(begin, data, strategy)
+    return prefix + [target_state for _ in range(start, end)] + suffix
 
 
-        sig_noise.add(
-            Interval(
-                begin,
-                end,
-                Data(
-                    kind=Kind.signal,
-                    data=data
-                ),
-            )
-        )
 
-        if strategy == EditStrategy.pending:
-            # no signal on either side, and transposition-original is nonempty
-            # the previous addition must've added a standalone signal
-            # either between gaps, or between a gap and the beginning/end
-            # of the noise
-            strategy = EditStrategy.standalone_signal
+signal_kinds = [Kind.signal, Kind.parameter]
+noise_kinds = [Kind.noise]
 
 
-        changes[error_interval.begin] = strategy
-
-    return changes
-
-
+charstate = []
 subcanvasses = []
 subcanvasses_display = FormattedTextControl(text="")
 gaps = []
 gaps_display = FormattedTextControl(text="")
 debug_display = FormattedTextControl(text="")
 
+def charstate_str():
+    return ''.join([{Kind.signal: "s", Kind.noise: "n"}[x] for x in charstate])
+
 
 def update(event):
     global subcanvasses
     global subcanvasses_display
+    global charstate
     global gaps
     global gaps_display
     global debug_display
 
-    # align signal to noise
-    sig_noise = find_gaps(sig_only(buffer.text), noise)
-    edits = reconcile(sig_noise)
-    buffer.text = colored(sig_noise)
+    debug(buffer.text)
 
-    intervals = sorted(sig_noise)
-    debug([intervals, edits])
+    # look for user changes
+    begin, end = find_targeted(noise, uncolored(buffer.text))
 
+    # update which characters are in/excluded based on what changed
+    charstate = toggled(noise, charstate, begin, end)
+
+    # show the user which characters are of which kind
+    buffer.text = colored(noise, charstate)
 
     # show user recent changes
-    subcanvasses = []
-    gaps = []
-    for interval in intervals:
-        if interval.data.kind is Kind.error:
-            raise Exception("cog doesn't edit, ")
-        elif interval.data.kind is Kind.signal:
-            subcanvasses.append(interval)
-        elif interval.data.kind is Kind.gap:
-            gaps.append(interval)
+    intervals = get_subvanvasses(noise, charstate)
+    subcanvasses = sorted([x for x in intervals if x.data.kind in signal_kinds])
+    gaps = sorted([x for x in intervals if x.data.kind in noise_kinds])
 
 
-    debug(sig_only(buffer.text))
+    debug(charstate_str())
+
 
     if event.selection_state:
         selected_from = min(
@@ -404,22 +295,64 @@ def update(event):
         render(subcanvasses, subcanvasses_display, cursor_position)
         render(gaps, gaps_display, cursor_position)
 
-def colored(it):
-    out = []
-    for interval in sorted(it):
-        if interval.data.kind is Kind.gap:
-            out.append(interval.data.data.lower())
+def colored(_noise, _charstate):
+
+    if _charstate == None:
+        return _noise
+    if len(_noise) != len(_charstate):
+        raise ValueError(f"we need a charstate for each noise char, length mismatch: {len(_noise)} != {len(_charstate)}")
+
+    output = ""
+    for c, n in zip(_charstate, _noise):
+        if c in signal_kinds:
+            output = output + n.upper()
         else:
-            out.append(interval.data.data.upper())
-    return ''.join(out)
+            output = output + n.lower()
+
+    debug(f"colored: {output}")
+    return output
+
     # todo: actual colors
 
-def sig_only(data):
-    out = ""
-    for char in data:
-        if char.isupper():
-            out = out + char
-    return out
+def get_subvanvasses(noise, charstate):
+
+    if charstate == None:
+        print("foo")
+    if len(noise) != len(charstate):
+        raise ValueError("we need a charstate for each noise char, length"
+                         f"mismatch: noise {len(noise)} != charstate {len(charstate)}")
+
+    it = IntervalTree()
+    begin = 0
+    end = 0
+    next_kind = None
+
+    def gobble(kind, begin):
+        "reached kind boundary, create a subcanvas for previous stuff"
+        debug(f"gobbling from {begin} to {end} for kind {kind}: {noise[begin:end]}")
+        it[begin:end] = Data(kind=kind, data=noise[begin:end])
+        begin = end + 1
+
+    # for each char, maybe generate subcanvas for whatever preceeds it
+    for i, _ in enumerate(noise):
+        current = charstate[i]
+        end = i + 1
+        try:
+            next_kind = charstate[i+1]
+        except IndexError:
+            gobble(current, begin)
+
+        if current and current != next_kind:
+            gobble(current, begin)
+            begin = i + 1
+
+
+    return it
+
+
+def uncolored(string):
+    return string.upper()
+
 
 def render(interval_list, interval_display, cursor_start, cursor_stop=None):
     interval_display.text = "\n".join(
@@ -494,6 +427,7 @@ def make_canvas(_noise, args):
     global root_container
 
     noise = _noise
+    charstate = [Kind.signal for _ in _noise]
 
     ui = [
         VSplit(
@@ -542,6 +476,9 @@ def make_canvas(_noise, args):
 
     # https://github.com/prompt-toolkit/python-prompt-toolkit/issues/502#issuecomment-466591259
     sys.stdin = sys.stderr
-    Application(
+    app = Application(
         key_bindings=kb, layout=Layout(root_container), editing_mode=EditingMode.VI
-    ).run()
+    )
+    app.vi_state.default_input_mode = InputMode.NAVIGATION
+    app.reset()
+    app.run()
