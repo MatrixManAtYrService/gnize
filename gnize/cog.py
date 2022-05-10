@@ -85,8 +85,8 @@ class Kind(Enum):
 
 
 subcanvas_color = {
-    Kind.signal: NAMED_COLORS["AntiqueWhite"],
-    Kind.noise: NAMED_COLORS["FireBrick"],
+    Kind.signal: NAMED_COLORS["Teal"],
+    Kind.noise: NAMED_COLORS["DarkGoldenRod"],
 }
 
 
@@ -268,24 +268,26 @@ class SubcanvasLexer(Lexer):
     def lex_document(self, document):
         def get_line(lineno):
 
-            line_len = len(document.lines[lineno])
-            colors = [NAMED_COLORS["khaki"]] * line_len
+            if not SubcanvasLexer.char_states:
+                raise Exception("Can't lex without subcanvas intervals")
 
-            if SubcanvasLexer.char_states:
+            formatted_chars = [None] * len(document.lines[lineno])
 
-                # how many characters are before this line?
-                prev = 0
-                for prev_line in range(lineno):
-                    prev += len(document.lines[prev_line]) + 1
+            # how many characters are before this line?
+            prev = 0
+            for prev_line in range(lineno):
+                prev += len(document.lines[prev_line]) + 1
 
-                # set colors for this line
-                for i, c in enumerate(document.lines[lineno]):
-                    char_no = prev + i
-                    char_kind = SubcanvasLexer.char_states[char_no]
-                    char_color = subcanvas_color[char_kind]
-                    colors[i] = char_color
+            # set colors for this line
+            for i, c in enumerate(document.lines[lineno]):
+                char_no = prev + i
+                char_kind = SubcanvasLexer.char_states[char_no]
+                char_color = subcanvas_color[char_kind]
+                formatted_chars[i] = (char_color, c)
 
-            return colors
+            return formatted_chars
+
+        return get_line
 
 
 def update(event):
@@ -377,6 +379,7 @@ def get_subvanvasses(noise, charstate):
 def colored(intervals, noise):
     return noise
 
+
 #    sig_intervals = filter(lambda x: x.data.kind in signal_kinds, intervals)
 #    gap_intervals = filter(lambda x: x.data.kind in noise_kinds, intervals)
 #
@@ -396,6 +399,8 @@ def colored(intervals, noise):
 
 def uncolored(string):
     return string
+
+
 #     out = ""
 #     for c in string:
 #         if c in "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz":
@@ -459,9 +464,7 @@ gap_style = "bold cyan"
 
 noise = ""
 signal = ""
-buffer = Buffer(
-    on_text_changed=update, on_cursor_position_changed=update
-)
+buffer = Buffer(on_text_changed=update, on_cursor_position_changed=update)
 
 buffer_header = FormattedTextControl(
     text="Delete noise until only signal remains",
@@ -489,7 +492,9 @@ def make_canvas(_noise, args):
             [
                 Frame(
                     title="Delete noise until only signal remains",
-                    body=Window(content=BufferControl(buffer=buffer, lexer=SubcanvasLexer())),
+                    body=Window(
+                        content=BufferControl(buffer=buffer, lexer=SubcanvasLexer())
+                    ),
                 ),
                 Frame(
                     title="Signals",
