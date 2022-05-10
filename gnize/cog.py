@@ -67,8 +67,12 @@ from prompt_toolkit.layout.containers import HSplit, VSplit, Window, WindowAlign
 from prompt_toolkit.layout.controls import BufferControl, FormattedTextControl
 from prompt_toolkit.widgets import Frame, HorizontalLine
 from prompt_toolkit.key_binding.vi_state import InputMode, ViState
-from rich.console import Console
+from prompt_toolkit.lexers import Lexer
+from prompt_toolkit.styles.named_colors import NAMED_COLORS
+from rich.console import Console, Text
 
+from io import StringIO
+from contextlib import redirect_stdout
 from gnize import dotdir, features
 
 
@@ -80,6 +84,12 @@ class Kind(Enum):
     parameter = auto()
 
 
+subcanvas_color = {
+    Kind.signal: NAMED_COLORS["AntiqueWhite"],
+    Kind.noise: NAMED_COLORS["FireBrick"],
+}
+
+
 @dataclass
 class Data:
     "Each interval of noise refers to..."
@@ -88,40 +98,43 @@ class Data:
     data: Union[str, Tuple[str, str]]
 
     def summary(self, interval: Interval, index, cursor_start=0, cursor_stop=None):
-
         def bounds(interval, pt):
-            if interval.begin == pt:
+            if interval.begin >= pt:
                 l = "["
             elif interval.begin < pt:
                 l = "("
-            elif pt < interval.begin:
-                l = "<"
             else:
                 l = ""
 
-            if interval.end == pt:
+            if interval.end - 1 <= pt:
                 r = "]"
-            elif interval.end + 1 >= pt:
+            elif interval.end - 1 > pt:
                 r = ")"
-            elif interval.end - 1 <= pt:
-                r = ">"
             else:
                 r = ""
 
+            debug(["bounds", cursor_start, cursor_stop, interval, pt, l, r])
             return (l, r)
 
-        ls, rs = bounds(interval, cursor_start)
-
+        l, r = bounds(interval, cursor_start)
 
         if cursor_stop is None:
             if interval.contains_point(cursor_start):
-                prefix = ls + "*" + rs
+                prefix = l + "*" + r
             else:
                 prefix = None
         else:
-            if interval.contains_point(cursor_start) or interval.contains_point(cursor_stop):
-                le, re = bounds(interval, cursor_stop)
-                prefix = ls + "*" + re
+            ls, rs = bounds(interval, cursor_start)
+            if (
+                cursor_start == interval.begin and cursor_stop == interval.end - 1
+            ) or Interval(begin=cursor_start, end=cursor_stop).contains_interval(
+                interval
+            ):
+                prefix = "[*]"
+            elif interval.contains_point(cursor_start) or interval.contains_point(
+                cursor_stop
+            ):
+                prefix = l + "*" + rs
             else:
                 prefix = None
 
@@ -159,6 +172,7 @@ class Error:
 
     def __lt__(self, other):
         return (self.original + self.user_change) < other
+
 
 def find_targeted(orig: str, change: str) -> Tuple[Union[int, None], Union[int, None]]:
     """
@@ -199,9 +213,9 @@ def find_targeted(orig: str, change: str) -> Tuple[Union[int, None], Union[int, 
     debug(f"targeted from {first_change} to {last_change}")
     return first_change, last_change
 
+
 def toggled(noise, _state, start, end):
     "The user has indicated a range, change the state for those chars"
-
 
     if not _state:
         # initialize al chars signal if no state is found
@@ -231,26 +245,53 @@ def toggled(noise, _state, start, end):
     return prefix + [target_state for _ in range(start, end)] + suffix
 
 
-
 signal_kinds = [Kind.signal, Kind.parameter]
 noise_kinds = [Kind.noise]
 
 
-charstate = []
+char_states = []
 subcanvasses = []
 subcanvasses_display = FormattedTextControl(text="")
 gaps = []
 gaps_display = FormattedTextControl(text="")
 debug_display = FormattedTextControl(text="")
 
+
 def charstate_str():
-    return ''.join([{Kind.signal: "s", Kind.noise: "n"}[x] for x in charstate])
+    return "".join([{Kind.signal: "s", Kind.noise: "n"}[x] for x in char_states])
+
+
+class SubcanvasLexer(Lexer):
+
+    char_states = None
+
+    def lex_document(self, document):
+        def get_line(lineno):
+
+            line_len = len(document.lines[lineno])
+            colors = [NAMED_COLORS["khaki"]] * line_len
+
+            if SubcanvasLexer.char_states:
+
+                # how many characters are before this line?
+                prev = 0
+                for prev_line in range(lineno):
+                    prev += len(document.lines[prev_line]) + 1
+
+                # set colors for this line
+                for i, c in enumerate(document.lines[lineno]):
+                    char_no = prev + i
+                    char_kind = SubcanvasLexer.char_states[char_no]
+                    char_color = subcanvas_color[char_kind]
+                    colors[i] = char_color
+
+            return colors
 
 
 def update(event):
     global subcanvasses
     global subcanvasses_display
-    global charstate
+    global char_states
     global gaps
     global gaps_display
     global debug_display
@@ -261,19 +302,19 @@ def update(event):
     begin, end = find_targeted(noise, uncolored(buffer.text))
 
     # update which characters are in/excluded based on what changed
-    charstate = toggled(noise, charstate, begin, end)
-
-    # show the user which characters are of which kind
-    buffer.text = colored(noise, charstate)
+    char_states = toggled(noise, char_states, begin, end)
 
     # show user recent changes
-    intervals = get_subvanvasses(noise, charstate)
+    intervals = get_subvanvasses(noise, char_states)
+    SubcanvasLexer.char_states = char_states
+
+    # show the user which characters are of which kind
+    buffer.text = colored(intervals, noise)
+
     subcanvasses = sorted([x for x in intervals if x.data.kind in signal_kinds])
     gaps = sorted([x for x in intervals if x.data.kind in noise_kinds])
 
-
     debug(charstate_str())
-
 
     if event.selection_state:
         selected_from = min(
@@ -295,32 +336,16 @@ def update(event):
         render(subcanvasses, subcanvasses_display, cursor_position)
         render(gaps, gaps_display, cursor_position)
 
-def colored(_noise, _charstate):
-
-    if _charstate == None:
-        return _noise
-    if len(_noise) != len(_charstate):
-        raise ValueError(f"we need a charstate for each noise char, length mismatch: {len(_noise)} != {len(_charstate)}")
-
-    output = ""
-    for c, n in zip(_charstate, _noise):
-        if c in signal_kinds:
-            output = output + n.upper()
-        else:
-            output = output + n.lower()
-
-    debug(f"colored: {output}")
-    return output
-
-    # todo: actual colors
 
 def get_subvanvasses(noise, charstate):
 
     if charstate == None:
         print("foo")
     if len(noise) != len(charstate):
-        raise ValueError("we need a charstate for each noise char, length"
-                         f"mismatch: noise {len(noise)} != charstate {len(charstate)}")
+        raise ValueError(
+            "we need a charstate for each noise char, length"
+            f"mismatch: noise {len(noise)} != charstate {len(charstate)}"
+        )
 
     it = IntervalTree()
     begin = 0
@@ -338,7 +363,7 @@ def get_subvanvasses(noise, charstate):
         current = charstate[i]
         end = i + 1
         try:
-            next_kind = charstate[i+1]
+            next_kind = charstate[i + 1]
         except IndexError:
             gobble(current, begin)
 
@@ -346,12 +371,36 @@ def get_subvanvasses(noise, charstate):
             gobble(current, begin)
             begin = i + 1
 
-
     return it
 
 
+def colored(intervals, noise):
+    return noise
+
+#    sig_intervals = filter(lambda x: x.data.kind in signal_kinds, intervals)
+#    gap_intervals = filter(lambda x: x.data.kind in noise_kinds, intervals)
+#
+#    c = Console()
+#    t = Text(noise)
+#    for sigint in sig_intervals:
+#        t.stylize(sig_style, sigint.begin, sigint.end)
+#    for gapint in gap_intervals:
+#        t.stylize(gap_style, gapint.begin, gapint.end)
+#
+#    with StringIO() as buf, redirect_stdout(buf):
+#        c.print(t)
+#        ansi_colored = buf.getvalue()
+#
+#    return ansi_colored
+
+
 def uncolored(string):
-    return string.upper()
+    return string
+#     out = ""
+#     for c in string:
+#         if c in "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz":
+#             out = out + c
+#     return out
 
 
 def render(interval_list, interval_display, cursor_start, cursor_stop=None):
@@ -405,12 +454,18 @@ def debug(message):
 
 atexit.register(close_debug_file)
 
+sig_style = "bold magenta"
+gap_style = "bold cyan"
 
 noise = ""
 signal = ""
-buffer = Buffer(on_text_changed=update, on_cursor_position_changed=update)
+buffer = Buffer(
+    on_text_changed=update, on_cursor_position_changed=update
+)
 
-buffer_header = FormattedTextControl(text="Delete noise until only signal remains")
+buffer_header = FormattedTextControl(
+    text="Delete noise until only signal remains",
+)
 subcanvasses_header = FormattedTextControl(text="Signal")
 gaps_header = FormattedTextControl(text="Noise")
 
@@ -434,7 +489,7 @@ def make_canvas(_noise, args):
             [
                 Frame(
                     title="Delete noise until only signal remains",
-                    body=Window(content=BufferControl(buffer=buffer)),
+                    body=Window(content=BufferControl(buffer=buffer, lexer=SubcanvasLexer())),
                 ),
                 Frame(
                     title="Signals",
