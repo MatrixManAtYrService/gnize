@@ -55,7 +55,7 @@ from datetime import datetime
 from enum import Enum, auto
 from pprint import pformat
 from textwrap import dedent, indent
-from typing import Union, Tuple, Iterator
+from typing import Union, Tuple, Iterator, List
 
 from intervaltree import Interval, IntervalTree
 from prompt_toolkit import Application
@@ -113,7 +113,7 @@ class Data:
             else:
                 r = ""
 
-            debug(["bounds", cursor_start, cursor_stop, interval, pt, l, r])
+            #debug(["bounds", cursor_start, cursor_stop, interval, pt, l, r])
             return (l, r)
 
         l, r = bounds(interval, cursor_start)
@@ -210,11 +210,14 @@ def find_targeted(orig: str, change: str) -> Tuple[Union[int, None], Union[int, 
         if last_change >= len(orig):
             last_change = None
 
+    if first_change and last_change and last_change < first_change:
+        first_change = last_change = None
+
     debug(f"targeted from {first_change} to {last_change}")
     return first_change, last_change
 
 
-def toggled(noise, _state, start, end):
+def toggled(noise, _state, start, end) -> List[Kind]:
     "The user has indicated a range, change the state for those chars"
 
     if not _state:
@@ -237,7 +240,9 @@ def toggled(noise, _state, start, end):
 
     prefix = _state[:start]
     suffix = _state[end:]
-    if sig > noise:
+    debug(f"sigs in toggle: {sig}")
+    debug(f"noise in toggle: {noise}")
+    if sig:
         target_state = Kind.noise
     else:
         target_state = Kind.signal
@@ -249,6 +254,7 @@ signal_kinds = [Kind.signal, Kind.parameter]
 noise_kinds = [Kind.noise]
 
 
+prev_char_states = []
 char_states = []
 subcanvasses = []
 subcanvasses_display = FormattedTextControl(text="")
@@ -301,7 +307,7 @@ def update(event):
     debug(buffer.text)
 
     # look for user changes
-    begin, end = find_targeted(noise, uncolored(buffer.text))
+    begin, end = find_targeted(noise, buffer.text)
 
     # update which characters are in/excluded based on what changed
     char_states = toggled(noise, char_states, begin, end)
@@ -311,7 +317,14 @@ def update(event):
     SubcanvasLexer.char_states = char_states
 
     # show the user which characters are of which kind
-    buffer.text = colored(intervals, noise)
+    buffer.text = noise
+
+    # if deleting, move cursor forward
+    debug(f"end: {end}, cursor_pos: { event._Buffer__cursor_position}")
+    cursor_position_override = None
+    if end and end > event._Buffer__cursor_position:
+        debug(f"setting cursor_position: {end}")
+        cursor_position_override = end
 
     subcanvasses = sorted([x for x in intervals if x.data.kind in signal_kinds])
     gaps = sorted([x for x in intervals if x.data.kind in noise_kinds])
@@ -338,15 +351,36 @@ def update(event):
         render(subcanvasses, subcanvasses_display, cursor_position)
         render(gaps, gaps_display, cursor_position)
 
+    buffer.cursor_position = cursor_position_override or event._Buffer__cursor_position
 
-def get_subvanvasses(noise, charstate):
+
+def render(interval_list, interval_display, cursor_start, cursor_stop=None):
+    interval_display.text = "\n".join(
+        [
+            x.data.summary(x, i, cursor_start, cursor_stop=cursor_stop)
+            for i, x in enumerate(interval_list)
+        ]
+    )
+
+class Direction(Enum):
+    back = auto()
+    forward = auto()
+
+def get_subvanvasses(noise, charstate) -> IntervalTree:
 
     if charstate == None:
-        print("foo")
+        charstate = [Kind.signal] * len(noise)
+
     if len(noise) != len(charstate):
         raise ValueError(
-            "we need a charstate for each noise char, length"
-            f"mismatch: noise {len(noise)} != charstate {len(charstate)}"
+            dedent(
+                f"""
+                we need a charstate for each noise char
+                {noise} (len: {len(noise)})
+                  !=
+                {char_states} (len: {len(char_states)})
+                """
+            )
         )
 
     it = IntervalTree()
@@ -374,47 +408,6 @@ def get_subvanvasses(noise, charstate):
             begin = i + 1
 
     return it
-
-
-def colored(intervals, noise):
-    return noise
-
-
-#    sig_intervals = filter(lambda x: x.data.kind in signal_kinds, intervals)
-#    gap_intervals = filter(lambda x: x.data.kind in noise_kinds, intervals)
-#
-#    c = Console()
-#    t = Text(noise)
-#    for sigint in sig_intervals:
-#        t.stylize(sig_style, sigint.begin, sigint.end)
-#    for gapint in gap_intervals:
-#        t.stylize(gap_style, gapint.begin, gapint.end)
-#
-#    with StringIO() as buf, redirect_stdout(buf):
-#        c.print(t)
-#        ansi_colored = buf.getvalue()
-#
-#    return ansi_colored
-
-
-def uncolored(string):
-    return string
-
-
-#     out = ""
-#     for c in string:
-#         if c in "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz":
-#             out = out + c
-#     return out
-
-
-def render(interval_list, interval_display, cursor_start, cursor_stop=None):
-    interval_display.text = "\n".join(
-        [
-            x.data.summary(x, i, cursor_start, cursor_stop=cursor_stop)
-            for i, x in enumerate(interval_list)
-        ]
-    )
 
 
 legend_left = dedent(
@@ -484,7 +477,7 @@ def make_canvas(_noise, args):
     global debug_file
     global root_container
 
-    noise = _noise
+    noise = _noise + '\n'
     charstate = [Kind.signal for _ in _noise]
 
     ui = [
