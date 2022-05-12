@@ -49,6 +49,7 @@ problem.  For now we just want create canvasses and query for them by fingerprin
 """
 
 import atexit
+from re import sub
 import sys
 from dataclasses import dataclass
 from datetime import datetime
@@ -85,8 +86,9 @@ class Kind(Enum):
 
 
 subcanvas_color = {
-    Kind.signal: NAMED_COLORS["Teal"],
-    Kind.noise: NAMED_COLORS["DarkGoldenRod"],
+    Kind.signal: "#859900",
+    Kind.parameter: "#2aa198",
+    Kind.noise: "#586e75",
 }
 
 
@@ -113,7 +115,7 @@ class Data:
             else:
                 r = ""
 
-            #debug(["bounds", cursor_start, cursor_stop, interval, pt, l, r])
+            # debug(["bounds", cursor_start, cursor_stop, interval, pt, l, r])
             return (l, r)
 
         l, r = bounds(interval, cursor_start)
@@ -256,10 +258,6 @@ noise_kinds = [Kind.noise]
 
 prev_char_states = []
 char_states = []
-subcanvasses = []
-subcanvasses_display = FormattedTextControl(text="")
-gaps = []
-gaps_display = FormattedTextControl(text="")
 debug_display = FormattedTextControl(text="")
 
 
@@ -269,13 +267,13 @@ def charstate_str():
 
 class SubcanvasLexer(Lexer):
 
-    char_states = None
+    char_states: List[Kind] = []
 
     def lex_document(self, document):
         def get_line(lineno):
 
             if not SubcanvasLexer.char_states:
-                raise Exception("Can't lex without subcanvas intervals")
+                raise Exception("Can't lex without subcanvas char states")
 
             formatted_chars = [None] * len(document.lines[lineno])
 
@@ -296,12 +294,36 @@ class SubcanvasLexer(Lexer):
         return get_line
 
 
+class SubcanvasSummaryLexer(Lexer):
+
+    subcanvas_states: List[Kind] = []
+
+    def lex_document(self, document):
+        def get_line(lineno):
+
+            if not SubcanvasSummaryLexer.subcanvas_states:
+                raise Exception("Can't lex without subcanvas interval states")
+
+            line_state = SubcanvasSummaryLexer.subcanvas_states[lineno]
+            line_color = subcanvas_color[line_state]
+
+            return [(line_color, c) for c in document.lines[lineno]]
+
+        return get_line
+
+
+subcanvasses = []
+subcanvas_summaries = Buffer()
+subcanvasses_display = BufferControl(
+    buffer=subcanvas_summaries, lexer=SubcanvasSummaryLexer()
+)
+
+
 def update(event):
     global subcanvasses
     global subcanvasses_display
+    global subcanvas_summaries
     global char_states
-    global gaps
-    global gaps_display
     global debug_display
 
     debug(buffer.text)
@@ -315,6 +337,9 @@ def update(event):
     # show user recent changes
     intervals = get_subvanvasses(noise, char_states)
     SubcanvasLexer.char_states = char_states
+    SubcanvasSummaryLexer.subcanvas_states = list(
+        map(lambda x: x.data.kind, sorted(intervals))
+    )
 
     # show the user which characters are of which kind
     buffer.text = noise
@@ -326,8 +351,16 @@ def update(event):
         debug(f"setting cursor_position: {end}")
         cursor_position_override = end
 
-    subcanvasses = sorted([x for x in intervals if x.data.kind in signal_kinds])
-    gaps = sorted([x for x in intervals if x.data.kind in noise_kinds])
+    subcanvasses = sorted(intervals)
+
+    def update_subcanvas_summaries(cursor_start, cursor_stop=None):
+        global subcanvas_summaries
+        subcanvas_summaries.text = "\n".join(
+            [
+                x.data.summary(x, i, cursor_start, cursor_stop=cursor_stop)
+                for i, x in enumerate(subcanvasses)
+            ]
+        )
 
     debug(charstate_str())
 
@@ -340,31 +373,22 @@ def update(event):
             event._Buffer__cursor_position,
             event.selection_state.original_cursor_position,
         )
-        debug_display.text = f"{len(subcanvasses)} subcanvasses, {len(gaps)} gaps, selected: {selected_from}, {selected_to}"
-        render(
-            subcanvasses, subcanvasses_display, selected_from, cursor_stop=selected_to
-        )
-        render(gaps, gaps_display, selected_from, selected_to)
+        debug_display.text = f"{len(subcanvasses)} subcanvasses, selected: {selected_from}, {selected_to}"
+        update_subcanvas_summaries(selected_from, cursor_stop=selected_to)
     else:
         cursor_position = event._Buffer__cursor_position
-        debug_display.text = f"{len(subcanvasses)} subcanvasses, {len(gaps)} gaps, cursor:{cursor_position}"
-        render(subcanvasses, subcanvasses_display, cursor_position)
-        render(gaps, gaps_display, cursor_position)
+        debug_display.text = (
+            f"{len(subcanvasses)} subcanvasses, cursor:{cursor_position}"
+        )
+        update_subcanvas_summaries(cursor_position)
 
     buffer.cursor_position = cursor_position_override or event._Buffer__cursor_position
 
 
-def render(interval_list, interval_display, cursor_start, cursor_stop=None):
-    interval_display.text = "\n".join(
-        [
-            x.data.summary(x, i, cursor_start, cursor_stop=cursor_stop)
-            for i, x in enumerate(interval_list)
-        ]
-    )
-
 class Direction(Enum):
     back = auto()
     forward = auto()
+
 
 def get_subvanvasses(noise, charstate) -> IntervalTree:
 
@@ -463,7 +487,6 @@ buffer_header = FormattedTextControl(
     text="Delete noise until only signal remains",
 )
 subcanvasses_header = FormattedTextControl(text="Signal")
-gaps_header = FormattedTextControl(text="Noise")
 
 selected_idx = 0
 
@@ -477,7 +500,7 @@ def make_canvas(_noise, args):
     global debug_file
     global root_container
 
-    noise = _noise + '\n'
+    noise = _noise + "\n"
     charstate = [Kind.signal for _ in _noise]
 
     ui = [
@@ -490,10 +513,9 @@ def make_canvas(_noise, args):
                     ),
                 ),
                 Frame(
-                    title="Signals",
+                    title="Subcanvasses",
                     body=Window(width=15, content=subcanvasses_display),
                 ),
-                Frame(title="Gaps", body=Window(width=10, content=gaps_display)),
             ]
         ),
         VSplit(
