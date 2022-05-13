@@ -51,6 +51,7 @@ problem.  For now we just want create canvasses and query for them by fingerprin
 import atexit
 from re import sub
 import sys
+from math import floor
 from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum, auto
@@ -93,75 +94,81 @@ subcanvas_color = {
 
 
 @dataclass
+class CharState:
+    selected: bool
+    kind: Kind
+    char: str
+    styled_char: Tuple[str, str]
+
+
+@dataclass
 class Data:
     "Each interval of noise refers to..."
 
     kind: Kind
     data: Union[str, Tuple[str, str]]
 
-    def summary(self, interval: Interval, index, cursor_start=0, cursor_stop=None):
-        def bounds(interval, pt):
-            if interval.begin >= pt:
-                l = "["
-            elif interval.begin < pt:
-                l = "("
+    def summary(
+        self, interval: Interval, cursor_start=0, cursor_stop=None
+    ) -> List[CharState]:
+
+        selection_end = cursor_stop or cursor_start or 1
+        selection = Interval(begin=cursor_start or 0, end=cursor_stop or cursor_start)
+        unabridged = []
+        for i, c in enumerate(interval.data.data):
+            idx = i + interval.begin
+            if c.isspace():
+                c = " "
+
+            selected = selection.contains_point(idx)
+
+            color = subcanvas_color[interval.data.kind]
+            if selected:
+                color = f"{color} bold"
+
+            unabridged.append(
+                CharState(
+                    selected=selected,
+                    kind=interval.data.kind,
+                    char=c,
+                    styled_char=(color, c),
+                )
+            )
+
+        debug("".join([x.char for x in unabridged]))
+        width = 10
+        part = int(width / 2) - 1
+
+        if len(unabridged) > width:
+            start = unabridged[:part]
+            end = unabridged[-part:]
+            omitted = unabridged[part:-part]
+
+            if any(filter(lambda x: x.selected, omitted)):
+                standin_selected = True
             else:
-                l = ""
+                standin_selected = False
 
-            if interval.end - 1 <= pt:
-                r = "]"
-            elif interval.end - 1 > pt:
-                r = ")"
+            if any(filter(lambda x: x.kind == Kind.signal, unabridged)):
+                standin_kind = Kind.signal
             else:
-                r = ""
+                standin_kind = Kind.noise
 
-            # debug(["bounds", cursor_start, cursor_stop, interval, pt, l, r])
-            return (l, r)
+            standin = [
+                CharState(
+                    selected=standin_selected,
+                    kind=standin_kind,
+                    char="...",
+                    styled_char=(subcanvas_color[standin_kind], "..."),
+                )
+            ]
 
-        l, r = bounds(interval, cursor_start)
-
-        if cursor_stop is None:
-            if interval.contains_point(cursor_start):
-                prefix = l + "*" + r
-            else:
-                prefix = None
         else:
-            ls, rs = bounds(interval, cursor_start)
-            if (
-                cursor_start == interval.begin and cursor_stop == interval.end - 1
-            ) or Interval(begin=cursor_start, end=cursor_stop).contains_interval(
-                interval
-            ):
-                prefix = "[*]"
-            elif interval.contains_point(cursor_start) or interval.contains_point(
-                cursor_stop
-            ):
-                prefix = l + "*" + rs
-            else:
-                prefix = None
+            start = unabridged
+            end = []
+            standin = []
 
-        # if the cursor isn't inside the subcanvas, display the subcanvas index
-        if not prefix:
-            prefix = f"{index}"
-
-        flat = " ".join(self.data.split())
-        width = len(flat)
-        if width > 16:
-            start = flat[:8]
-            end = flat[-8:]
-            connector = ".."
-        elif width > 8:
-            midpoint = int(width / 2)
-            start = flat[:midpoint]
-            end = flat[midpoint:]
-            connector = ".."
-        else:
-            start = flat
-            end = ""
-            connector = ""
-
-        debug(prefix + f"{start}{connector}{end}")
-        return prefix + f"{start}{connector}{end}"
+        return start + standin + end
 
 
 @dataclass
@@ -272,19 +279,13 @@ class SubcanvasLexer(Lexer):
     def lex_document(self, document):
         def get_line(lineno):
 
-            if not SubcanvasLexer.char_states:
-                raise Exception("Can't lex without subcanvas char states")
+            line_start = line_start_idx[lineno]
 
             formatted_chars = [None] * len(document.lines[lineno])
 
-            # how many characters are before this line?
-            prev = 0
-            for prev_line in range(lineno):
-                prev += len(document.lines[prev_line]) + 1
-
             # set colors for this line
             for i, c in enumerate(document.lines[lineno]):
-                char_no = prev + i
+                char_no = line_start + i
                 char_kind = SubcanvasLexer.char_states[char_no]
                 char_color = subcanvas_color[char_kind]
                 formatted_chars[i] = (char_color, c)
@@ -296,18 +297,21 @@ class SubcanvasLexer(Lexer):
 
 class SubcanvasSummaryLexer(Lexer):
 
-    subcanvas_states: List[Kind] = []
+    cursor_start = 0
+    cursor_stop = None
+    it: IntervalTree = None
 
     def lex_document(self, document):
         def get_line(lineno):
 
-            if not SubcanvasSummaryLexer.subcanvas_states:
-                raise Exception("Can't lex without subcanvas interval states")
+            interval = sorted(SubcanvasSummaryLexer.it)[lineno]
+            summary = interval.data.summary(
+                interval,
+                cursor_start=SubcanvasSummaryLexer.cursor_start,
+                cursor_stop=SubcanvasSummaryLexer.cursor_stop,
+            )
 
-            line_state = SubcanvasSummaryLexer.subcanvas_states[lineno]
-            line_color = subcanvas_color[line_state]
-
-            return [(line_color, c) for c in document.lines[lineno]]
+            return [s.styled_char for s in summary]
 
         return get_line
 
@@ -336,10 +340,9 @@ def update(event):
 
     # show user recent changes
     intervals = get_subvanvasses(noise, char_states)
+
     SubcanvasLexer.char_states = char_states
-    SubcanvasSummaryLexer.subcanvas_states = list(
-        map(lambda x: x.data.kind, sorted(intervals))
-    )
+    SubcanvasSummaryLexer.it = intervals
 
     # show the user which characters are of which kind
     buffer.text = noise
@@ -355,34 +358,32 @@ def update(event):
 
     def update_subcanvas_summaries(cursor_start, cursor_stop=None):
         global subcanvas_summaries
-        subcanvas_summaries.text = "\n".join(
-            [
-                x.data.summary(x, i, cursor_start, cursor_stop=cursor_stop)
-                for i, x in enumerate(subcanvasses)
-            ]
-        )
 
     debug(charstate_str())
 
+    # color summaries based on current selection
     if event.selection_state:
-        selected_from = min(
+        SubcanvasSummaryLexer.cursor_start = min(
             event._Buffer__cursor_position,
             event.selection_state.original_cursor_position,
         )
-        selected_to = max(
+        SubcanvasSummaryLexer.cursor_stop = max(
             event._Buffer__cursor_position,
             event.selection_state.original_cursor_position,
         )
-        debug_display.text = f"{len(subcanvasses)} subcanvasses, selected: {selected_from}, {selected_to}"
-        update_subcanvas_summaries(selected_from, cursor_stop=selected_to)
     else:
-        cursor_position = event._Buffer__cursor_position
-        debug_display.text = (
-            f"{len(subcanvasses)} subcanvasses, cursor:{cursor_position}"
-        )
-        update_subcanvas_summaries(cursor_position)
+        SubcanvasSummaryLexer.cursor_start = event._Buffer__cursor_position
 
+    # give interval starts, lexer will replace each with a summary
+    interval_starts = []
+    for subcanvas in subcanvasses:
+        interval_starts.append(str(subcanvas.begin))
+    subcanvas_summaries.text = "\n".join(interval_starts)
+
+    # set editor cursor
     buffer.cursor_position = cursor_position_override or event._Buffer__cursor_position
+
+    # todo: set debug_display.text
 
 
 class Direction(Enum):
@@ -476,10 +477,8 @@ def debug(message):
 
 atexit.register(close_debug_file)
 
-sig_style = "bold magenta"
-gap_style = "bold cyan"
-
 noise = ""
+line_start_idx = {}
 signal = ""
 buffer = Buffer(on_text_changed=update, on_cursor_position_changed=update)
 
@@ -501,6 +500,13 @@ def make_canvas(_noise, args):
     global root_container
 
     noise = _noise + "\n"
+
+    # lexers care about line numbers, so cache them
+    idx = 0
+    for i, n in enumerate(noise.split("\n")):
+        line_start_idx[i] = idx
+        idx = idx + len(n) + 1
+
     charstate = [Kind.signal for _ in _noise]
 
     ui = [
