@@ -53,6 +53,7 @@ class Colors:
 @dataclass
 class Runtime:
     debug_log: str
+    debug_obj: str
 
 
 @dataclass_json
@@ -63,8 +64,6 @@ class Config:
     fingerprints: FingerprintStore
     colors: Colors
     runtime: Runtime
-
-
 
 
 default_config = from_dict(
@@ -80,7 +79,10 @@ default_config = from_dict(
             "gaps": {"primary": "#b58900", "secondary": "#cb4b16"},
             "signals": {"primary": "#2aa198", "secondary": "#6c71c4"},
         },
-        "runtime": {"debug_log": "./.gnize.debug"},
+        "runtime": {
+            "debug_log": "./.gnize.debug.log",
+            "debug_obj": "./.gnize.debug.json",
+        },
     },
 )
 

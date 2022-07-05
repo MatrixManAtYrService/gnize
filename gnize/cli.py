@@ -55,11 +55,11 @@ def gn():
         print(stats, file=sys.stderr)
 
 def cog():
-    noise = _read_stdin()
 
     parser = argparse.ArgumentParser(description="read stdin, identify a signal in the noise")
     parser.add_argument("-d", "--debug", action="store_true")
     args = parser.parse_args()
 
+    noise = _read_stdin()
     signal = make_canvas(noise, args)
 

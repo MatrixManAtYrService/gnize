@@ -111,4 +111,4 @@ venv.bak/
 *.sql
 gcloud/
 
-.gnize.debug
+.gnize.debug.*

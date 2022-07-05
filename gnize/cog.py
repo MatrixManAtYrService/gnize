@@ -49,33 +49,33 @@ problem.  For now we just want create canvasses and query for them by fingerprin
 """
 
 import atexit
-from re import sub
 import sys
-from math import floor
+from contextlib import redirect_stdout
 from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum, auto
+from io import StringIO
+from math import floor
 from pprint import pformat
+from re import sub
 from textwrap import dedent, indent
-from typing import Union, Tuple, Iterator, List
+from typing import Iterator, List, Tuple, Union
 
+import yaml
+from gnize import dotdir, features
 from intervaltree import Interval, IntervalTree
 from prompt_toolkit import Application
 from prompt_toolkit.buffer import Buffer
 from prompt_toolkit.enums import EditingMode
 from prompt_toolkit.key_binding import KeyBindings
+from prompt_toolkit.key_binding.vi_state import InputMode, ViState
 from prompt_toolkit.layout import Layout
 from prompt_toolkit.layout.containers import HSplit, VSplit, Window, WindowAlign
 from prompt_toolkit.layout.controls import BufferControl, FormattedTextControl
-from prompt_toolkit.widgets import Frame, HorizontalLine
-from prompt_toolkit.key_binding.vi_state import InputMode, ViState
 from prompt_toolkit.lexers import Lexer
 from prompt_toolkit.styles.named_colors import NAMED_COLORS
+from prompt_toolkit.widgets import Frame, HorizontalLine
 from rich.console import Console, Text
-
-from io import StringIO
-from contextlib import redirect_stdout
-from gnize import dotdir, features
 
 
 class Kind(Enum):
@@ -475,6 +475,20 @@ def debug(message):
         debug_file.flush()
 
 
+def debug_dump():
+    with open(config.runtime.debug_obj, "w") as f:
+        f.write(
+            yaml.dump(
+                {
+                    "states": list(
+                        map(list, zip(noise, [x.name for x in char_states]))
+                    ),
+                    "subcanvasses": [x.data.data for x in subcanvasses],
+                }
+            )
+        )
+
+
 atexit.register(close_debug_file)
 
 noise = ""
@@ -553,6 +567,8 @@ def make_canvas(_noise, args):
 
     @kb.add("c-c")
     def done(event):
+        if args.debug:
+            debug_dump()
         event.app.exit()
 
     # https://github.com/prompt-toolkit/python-prompt-toolkit/issues/502#issuecomment-466591259
