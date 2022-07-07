@@ -77,7 +77,7 @@ default_config = from_dict(
         },
         "colors": {
             "gaps": {"primary": "#b58900", "secondary": "#cb4b16"},
-            "signals": {"primary": "#2aa198", "secondary": "#6c71c4"},
+            "signals": {"primary": "#2aa198", "secondary": "#7c81d4"},
         },
         "runtime": {
             "debug_log": "./.gnize.debug.log",

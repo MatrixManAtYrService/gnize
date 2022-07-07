@@ -53,29 +53,27 @@ import sys
 from contextlib import redirect_stdout
 from dataclasses import dataclass
 from datetime import datetime
+from difflib import context_diff
 from enum import Enum, auto
 from io import StringIO
-from math import floor
 from pprint import pformat
-from re import sub
 from textwrap import dedent, indent
 from typing import Iterator, List, Tuple, Union
 
 import yaml
-from gnize import dotdir, features
+from gnize import dotdir
 from intervaltree import Interval, IntervalTree
 from prompt_toolkit import Application
 from prompt_toolkit.buffer import Buffer
 from prompt_toolkit.enums import EditingMode
 from prompt_toolkit.key_binding import KeyBindings
-from prompt_toolkit.key_binding.vi_state import InputMode, ViState
+from prompt_toolkit.key_binding.vi_state import InputMode
 from prompt_toolkit.layout import Layout
 from prompt_toolkit.layout.containers import HSplit, VSplit, Window, WindowAlign
 from prompt_toolkit.layout.controls import BufferControl, FormattedTextControl
 from prompt_toolkit.lexers import Lexer
-from prompt_toolkit.styles.named_colors import NAMED_COLORS
 from prompt_toolkit.widgets import Frame, HorizontalLine
-from rich.console import Console, Text
+from tabulate import tabulate
 
 
 class Kind(Enum):
@@ -87,7 +85,7 @@ class Kind(Enum):
 
 
 subcanvas_color = {
-    Kind.signal: "#859900",
+    Kind.signal: "#B5B900",
     Kind.parameter: "#2aa198",
     Kind.noise: "#586e75",
 }
@@ -135,7 +133,6 @@ class Data:
                 )
             )
 
-        debug("".join([x.char for x in unabridged]))
         width = 10
         part = int(width / 2) - 1
 
@@ -183,12 +180,16 @@ class Error:
         return (self.original + self.user_change) < other
 
 
-def find_targeted(orig: str, change: str) -> Tuple[Union[int, None], Union[int, None]]:
+def find_targeted(
+    orig: str, change: str, cursor_pos: int, prev_cursor_pos: int
+) -> Tuple[Union[int, None], Union[int, None], Union[int, None]]:
     """
     Given two strings, the first being the original and the second
     being whatever change the user applied, find the bounds of the
     change.
     """
+
+    new_cursor_pos = None
 
     def find_mismatch(orig_iter: Iterator, change_iter: Iterator) -> Union[int, None]:
         "walk the iterators and indicate where they produce different values"
@@ -207,23 +208,44 @@ def find_targeted(orig: str, change: str) -> Tuple[Union[int, None], Union[int, 
             return None
         return i or None
 
-    first_change = find_mismatch(iter(orig), iter(change))
-    if first_change != None and first_change >= len(orig):
-        first_change = None
-
-    from_back = find_mismatch(reversed(orig), reversed(change))
-    if from_back == None or from_back >= len(orig):
-        last_change = None
-    else:
-        last_change = len(orig) - from_back
-        if last_change >= len(orig):
-            last_change = None
-
-    if first_change and last_change and last_change < first_change:
+    delta = len(orig) - len(change)
+    if not delta:
         first_change = last_change = None
+    else:
 
-    debug(f"targeted from {first_change} to {last_change}")
-    return first_change, last_change
+        first_change = find_mismatch(iter(orig), iter(change))
+        if first_change != None and first_change >= len(orig):
+            first_change = None
+
+        from_back = find_mismatch(reversed(orig), reversed(change))
+        if from_back == None or from_back >= len(orig):
+            last_change = None
+        else:
+            last_change = len(orig) - from_back
+            if last_change >= len(orig):
+                last_change = None
+
+        first_change = first_change or 0
+        last_change = last_change or len(orig) - 1
+
+        if last_change <= first_change:
+            debug(
+                f"naievely got {first_change} to {last_change}, length_delta: {delta} "
+                f"Resolving via: cursor_pos {cursor_pos}->{prev_cursor_pos}"
+            )
+            if cursor_pos >= prev_cursor_pos:
+                first_change = cursor_pos
+                last_change = cursor_pos + delta
+                new_cursor_pos = None
+            else:
+                last_change = prev_cursor_pos
+                first_change = prev_cursor_pos - delta
+                new_cursor_pos = None
+
+    debug(
+        f"targeted from {first_change} to {last_change}, cursor_pos {cursor_pos}->{prev_cursor_pos}"
+    )
+    return first_change, last_change, new_cursor_pos
 
 
 def toggled(noise, _state, start, end) -> List[Kind]:
@@ -303,7 +325,6 @@ class SubcanvasSummaryLexer(Lexer):
 
     def lex_document(self, document):
         def get_line(lineno):
-
             interval = sorted(SubcanvasSummaryLexer.it)[lineno]
             summary = interval.data.summary(
                 interval,
@@ -316,11 +337,45 @@ class SubcanvasSummaryLexer(Lexer):
         return get_line
 
 
+def format_event(event, previous_event=None):
+    # shortens event for debug display
+    def show(kv):
+        k, v = kv
+        if not str(v):
+            return False
+        if str(v)[-1] == ">":
+            return False
+        if str(v) == "None":
+            return False
+        if "do_stack" in k:
+            return False
+        if "validation" in k:
+            return False
+        if "completer" in k:
+            return False
+        return True
+
+    with StringIO() as buf, redirect_stdout(buf):
+        if not previous_event:
+            tbl = list(map(list, filter(show, event.__dict__.items())))
+            tbl_out = tabulate(tbl)
+            tbl_out_simpler = "\n".join(tbl_out.split("\n")[1:-1])
+            print(indent(tbl_out_simpler, prefix="    "))
+        return buf.getvalue()
+
+
 subcanvasses = []
 subcanvas_summaries = Buffer()
 subcanvasses_display = BufferControl(
     buffer=subcanvas_summaries, lexer=SubcanvasSummaryLexer()
 )
+
+cursor_pos = 0
+prev_cursor_pos = 0
+reentrancy = 0
+iterations = 0
+
+prev_event = None
 
 
 def update(event):
@@ -329,61 +384,83 @@ def update(event):
     global subcanvas_summaries
     global char_states
     global debug_display
+    global debug_buffer
+    global cursor_pos
+    global prev_cursor_pos
+    global reentrancy
+    global prev_event
+    global iterations
 
-    debug(buffer.text)
+    # if this event's handler causes it to fire again before it is handled,
+    # skip most of the handler until the first handling is completed
+    reentrancy += 1
+    if reentrancy == 1:
+        iterations += 1
 
-    # look for user changes
-    begin, end = find_targeted(noise, buffer.text)
+        debug(f"iteration: {iterations}")
+        debug("event:\n" + format_event(event))
 
-    # update which characters are in/excluded based on what changed
-    char_states = toggled(noise, char_states, begin, end)
-
-    # show user recent changes
-    intervals = get_subvanvasses(noise, char_states)
-
-    SubcanvasLexer.char_states = char_states
-    SubcanvasSummaryLexer.it = intervals
-
-    # show the user which characters are of which kind
-    buffer.text = noise
-
-    # if deleting, move cursor forward
-    debug(f"end: {end}, cursor_pos: { event._Buffer__cursor_position}")
-    cursor_position_override = None
-    if end and end > event._Buffer__cursor_position:
-        debug(f"setting cursor_position: {end}")
-        cursor_position_override = end
-
-    subcanvasses = sorted(intervals)
-
-    def update_subcanvas_summaries(cursor_start, cursor_stop=None):
-        global subcanvas_summaries
-
-    debug(charstate_str())
-
-    # color summaries based on current selection
-    if event.selection_state:
-        SubcanvasSummaryLexer.cursor_start = min(
-            event._Buffer__cursor_position,
-            event.selection_state.original_cursor_position,
+        # look for user changes
+        begin, end, cursor_position_override = find_targeted(
+            noise, buffer.text, cursor_pos, prev_cursor_pos
         )
-        SubcanvasSummaryLexer.cursor_stop = max(
-            event._Buffer__cursor_position,
-            event.selection_state.original_cursor_position,
+
+        # update which characters are in/excluded based on what changed
+        char_states = toggled(noise, char_states, begin, end)
+
+        # show user recent changes
+        intervals = get_subvanvasses(noise, char_states)
+
+        SubcanvasLexer.char_states = char_states
+        SubcanvasSummaryLexer.it = intervals
+
+        # show the user which characters are of which kind
+        buffer.text = noise
+
+        subcanvasses = sorted(intervals)
+
+        def update_subcanvas_summaries(cursor_start, cursor_stop=None):
+            global subcanvas_summaries
+
+        debug("charstate: " + charstate_str())
+
+        # color summaries based on current selection
+        if event.selection_state:
+            SubcanvasSummaryLexer.cursor_start = min(
+                event._Buffer__cursor_position,
+                event.selection_state.original_cursor_position,
+            )
+            SubcanvasSummaryLexer.cursor_stop = max(
+                event._Buffer__cursor_position,
+                event.selection_state.original_cursor_position,
+            )
+        else:
+            SubcanvasSummaryLexer.cursor_start = event._Buffer__cursor_position
+
+        # give interval starts, lexer will replace each with a summary
+        interval_starts = []
+        for subcanvas in subcanvasses:
+            interval_starts.append(str(subcanvas.begin))
+        subcanvas_summaries.text = "\n".join(interval_starts)
+
+        if not cursor_position_override:
+            if end and end > event._Buffer__cursor_position:
+                debug(f"setting cursor_position: {end}")
+                cursor_position_override = end
+
+        # set cursor position
+        buffer.cursor_position = (
+            cursor_position_override or event._Buffer__cursor_position
         )
-    else:
-        SubcanvasSummaryLexer.cursor_start = event._Buffer__cursor_position
+        prev_cursor_pos = cursor_pos
+        cursor_pos = buffer.cursor_position
 
-    # give interval starts, lexer will replace each with a summary
-    interval_starts = []
-    for subcanvas in subcanvasses:
-        interval_starts.append(str(subcanvas.begin))
-    subcanvas_summaries.text = "\n".join(interval_starts)
-
-    # set editor cursor
-    buffer.cursor_position = cursor_position_override or event._Buffer__cursor_position
-
-    # todo: set debug_display.text
+    # populate debug_display
+    reentrancy -= 1
+    if not reentrancy:
+        debug_display.text = debug_buffer
+        debug_buffer = ""
+        prev_event = event
 
 
 class Direction(Enum):
@@ -415,7 +492,9 @@ def get_subvanvasses(noise, charstate) -> IntervalTree:
 
     def gobble(kind, begin):
         "reached kind boundary, create a subcanvas for previous stuff"
-        debug(f"gobbling from {begin} to {end} for kind {kind}: {noise[begin:end]}")
+        debug(f"gobbling from {begin} to {end} for {kind}:")
+        debug(indent(noise[begin:end], prefix="    "))
+
         it[begin:end] = Data(kind=kind, data=noise[begin:end])
         begin = end + 1
 
@@ -464,15 +543,24 @@ def close_debug_file():
         debug_file.close()
 
 
+debug_buffer = ""
+
+
 def debug(message):
+    global debug_buffer
+
+    if message[-1] != "\n":
+        message += "\n"
+
     if debug_file:
         if type(message) is not str:
             debug_file.write("----\n")
-            debug_file.write(indent(pformat(message), "    "))
-            debug_file.write("\n")
+            debug_file.write(indent(pformat(message), prefix="    "))
+            debug_file.write("\n\n")
         else:
-            debug_file.write(dedent(message).strip() + "\n")
+            debug_file.write(dedent(message).strip() + "\n\n")
         debug_file.flush()
+    debug_buffer += str(message)
 
 
 def debug_dump():
@@ -505,6 +593,9 @@ selected_idx = 0
 
 root_container = None
 config = dotdir.make_or_get()
+
+
+app = None
 
 
 def make_canvas(_noise, args):

@@ -22,6 +22,7 @@ setup(
         "rich",
         "intervaltree",
         "pexpect",
+        "tabulate",
     ],
     entry_points={
         "console_scripts": [
