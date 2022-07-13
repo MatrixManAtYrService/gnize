@@ -53,7 +53,6 @@ import sys
 from contextlib import redirect_stdout
 from dataclasses import dataclass
 from datetime import datetime
-from difflib import context_diff
 from enum import Enum, auto
 from io import StringIO
 from pprint import pformat
@@ -61,10 +60,13 @@ from textwrap import dedent, indent
 from typing import Iterator, List, Tuple, Union
 
 import yaml
-from gnize import dotdir
 from intervaltree import Interval, IntervalTree
+from tabulate import tabulate
+
+from gnize import dotdir
 from prompt_toolkit import Application
 from prompt_toolkit.buffer import Buffer
+from prompt_toolkit.document import Document
 from prompt_toolkit.enums import EditingMode
 from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.key_binding.vi_state import InputMode
@@ -73,7 +75,6 @@ from prompt_toolkit.layout.containers import HSplit, VSplit, Window, WindowAlign
 from prompt_toolkit.layout.controls import BufferControl, FormattedTextControl
 from prompt_toolkit.lexers import Lexer
 from prompt_toolkit.widgets import Frame, HorizontalLine
-from tabulate import tabulate
 
 
 class Kind(Enum):
@@ -252,7 +253,7 @@ def toggled(noise, _state, start, end) -> List[Kind]:
     "The user has indicated a range, change the state for those chars"
 
     if not _state:
-        # initialize al chars signal if no state is found
+        # initialize all chars as signal if no state is found
         return [Kind.signal for _ in noise]
 
     if start == end or end == None:
@@ -353,9 +354,12 @@ def format_event(event, previous_event=None):
             return False
         if "completer" in k:
             return False
+        if "_document_cache" in k:
+            return False
         return True
 
     with StringIO() as buf, redirect_stdout(buf):
+        print("event:")
         if not previous_event:
             tbl = list(map(list, filter(show, event.__dict__.items())))
             tbl_out = tabulate(tbl)
@@ -376,12 +380,14 @@ reentrancy = 0
 iterations = 0
 
 prev_event = None
+prev_selection_ranges = None
 
 
 def update(event):
     global subcanvasses
     global subcanvasses_display
     global subcanvas_summaries
+    global prev_char_states
     global char_states
     global debug_display
     global debug_buffer
@@ -390,6 +396,8 @@ def update(event):
     global reentrancy
     global prev_event
     global iterations
+    global pending_debug_buffer
+    global prev_selection_ranges
 
     # if this event's handler causes it to fire again before it is handled,
     # skip most of the handler until the first handling is completed
@@ -397,70 +405,97 @@ def update(event):
     if reentrancy == 1:
         iterations += 1
 
-        debug(f"iteration: {iterations}")
-        debug("event:\n" + format_event(event))
+        try:
 
-        # look for user changes
-        begin, end, cursor_position_override = find_targeted(
-            noise, buffer.text, cursor_pos, prev_cursor_pos
-        )
+            debug(f"iteration: {iterations}")
+            debug(format_event(event))
 
-        # update which characters are in/excluded based on what changed
-        char_states = toggled(noise, char_states, begin, end)
+            selection_ranges = list(event.document.selection_ranges())
+            debug(f"selection: {selection_ranges}")
+            if prev_selection_ranges:
+                debug(f"prevous selection: {prev_selection_ranges}")
 
-        # show user recent changes
-        intervals = get_subvanvasses(noise, char_states)
-
-        SubcanvasLexer.char_states = char_states
-        SubcanvasSummaryLexer.it = intervals
-
-        # show the user which characters are of which kind
-        buffer.text = noise
-
-        subcanvasses = sorted(intervals)
-
-        def update_subcanvas_summaries(cursor_start, cursor_stop=None):
-            global subcanvas_summaries
-
-        debug("charstate: " + charstate_str())
-
-        # color summaries based on current selection
-        if event.selection_state:
-            SubcanvasSummaryLexer.cursor_start = min(
-                event._Buffer__cursor_position,
-                event.selection_state.original_cursor_position,
+            # look for user changes
+            begin, end, cursor_position_override = find_targeted(
+                noise, buffer.text, cursor_pos, prev_cursor_pos
             )
-            SubcanvasSummaryLexer.cursor_stop = max(
-                event._Buffer__cursor_position,
-                event.selection_state.original_cursor_position,
-            )
-        else:
-            SubcanvasSummaryLexer.cursor_start = event._Buffer__cursor_position
 
-        # give interval starts, lexer will replace each with a summary
-        interval_starts = []
-        for subcanvas in subcanvasses:
-            interval_starts.append(str(subcanvas.begin))
-        subcanvas_summaries.text = "\n".join(interval_starts)
+            # update which characters are in/excluded based on what changed
+            debug("char_states: " + str(char_states))
+            char_states = toggled(noise, char_states, begin, end)
 
-        if not cursor_position_override:
-            if end and end > event._Buffer__cursor_position:
-                debug(f"setting cursor_position: {end}")
-                cursor_position_override = end
+            # show user recent changes
+            try:
+                intervals = get_subcanvasses(noise, char_states)
+            except AlignmentError as err:
+                debug_next(str(err))
+                buffer.text = noise
+                char_states = prev_char_states
+            else:
 
-        # set cursor position
-        buffer.cursor_position = (
-            cursor_position_override or event._Buffer__cursor_position
-        )
-        prev_cursor_pos = cursor_pos
-        cursor_pos = buffer.cursor_position
+                SubcanvasLexer.char_states = char_states
+                SubcanvasSummaryLexer.it = intervals
 
-    # populate debug_display
+                # show the user which characters are of which kind
+                buffer.text = noise
+
+                subcanvasses = sorted(intervals)
+
+                def update_subcanvas_summaries(cursor_start, cursor_stop=None):
+                    global subcanvas_summaries
+
+                debug("charstate: " + charstate_str())
+
+                # color summaries based on current selection
+                if event.selection_state:
+                    SubcanvasSummaryLexer.cursor_start = min(
+                        event._Buffer__cursor_position,
+                        event.selection_state.original_cursor_position,
+                    )
+                    SubcanvasSummaryLexer.cursor_stop = max(
+                        event._Buffer__cursor_position,
+                        event.selection_state.original_cursor_position,
+                    )
+                else:
+                    SubcanvasSummaryLexer.cursor_start = event._Buffer__cursor_position
+
+                # give interval starts, lexer will replace each with a summary
+                interval_starts = []
+                for subcanvas in subcanvasses:
+                    interval_starts.append(str(subcanvas.begin))
+                subcanvas_summaries.text = "\n".join(interval_starts)
+
+                if not cursor_position_override:
+                    if end and end > event._Buffer__cursor_position:
+                        debug(f"setting cursor_position: {end}")
+                        cursor_position_override = end
+
+                # set cursor position
+                buffer.cursor_position = (
+                    cursor_position_override or event._Buffer__cursor_position
+                )
+                prev_cursor_pos = cursor_pos
+                cursor_pos = buffer.cursor_position
+
+        except Exception as ex:
+            # don't hide debug data just because we got an exception
+            print(pending_debug_buffer)
+            print(debug_buffer)
+            raise ex
+
+    # run at the end of the outermost call
     reentrancy -= 1
     if not reentrancy:
+
+        # populate debug_display
         debug_display.text = debug_buffer
-        debug_buffer = ""
+        debug_buffer = "" or pending_debug_buffer
+        if pending_debug_buffer:
+            pending_debug_buffer = ""
+
         prev_event = event
+        prev_char_states = char_states
+        prev_selection_ranges = selection_ranges
 
 
 class Direction(Enum):
@@ -468,13 +503,17 @@ class Direction(Enum):
     forward = auto()
 
 
-def get_subvanvasses(noise, charstate) -> IntervalTree:
+class AlignmentError(Exception):
+    pass
+
+
+def get_subcanvasses(noise, charstate) -> IntervalTree:
 
     if charstate == None:
         charstate = [Kind.signal] * len(noise)
 
     if len(noise) != len(charstate):
-        raise ValueError(
+        raise AlignmentError(
             dedent(
                 f"""
                 we need a charstate for each noise char
@@ -543,7 +582,16 @@ def close_debug_file():
         debug_file.close()
 
 
+pending_debug_buffer = ""
 debug_buffer = ""
+
+
+def debug_next(message):
+    global pending_debug_buffer
+
+    if message[-1] != "\n":
+        message += "\n"
+    pending_debug_buffer += str(message)
 
 
 def debug(message):
@@ -604,7 +652,7 @@ def make_canvas(_noise, args):
     global debug_file
     global root_container
 
-    noise = _noise + "\n"
+    noise = _noise  # + "\n"
 
     # lexers care about line numbers, so cache them
     idx = 0
@@ -668,5 +716,6 @@ def make_canvas(_noise, args):
         key_bindings=kb, layout=Layout(root_container), editing_mode=EditingMode.VI
     )
     app.vi_state.default_input_mode = InputMode.NAVIGATION
+    app.vi_state.allowed_input_modes = [InputMode.NAVIGATION]
     app.reset()
     app.run()
