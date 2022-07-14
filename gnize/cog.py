@@ -57,8 +57,9 @@ from enum import Enum, auto
 from io import StringIO
 from pprint import pformat
 from textwrap import dedent, indent
-from typing import Iterator, List, Tuple, Union
+from typing import Iterator, List, Tuple, Union, Optional
 
+import traceback
 import yaml
 from intervaltree import Interval, IntervalTree
 from tabulate import tabulate
@@ -182,104 +183,161 @@ class Error:
 
 
 def find_targeted(
-    orig: str, change: str, cursor_pos: int, prev_cursor_pos: int
-) -> Tuple[Union[int, None], Union[int, None], Union[int, None]]:
+    orig: str,
+    change: str,
+    cursor_pos: int,
+    prev_cursor_pos: int,
+    selections: List[Tuple[int, int]],
+    prev_selections: List[Tuple[int, int]],
+) -> Tuple[List[Tuple[int, int]], Optional[int]]:
     """
     Given two strings, the first being the original and the second
     being whatever change the user applied, find the bounds of the
-    change.
+    changes.
+
+    Returns a pair:
+     - list of changed ranges
+     - new cursor position (or None)
     """
 
-    new_cursor_pos = None
+    # our goal is to figure out index-ranges for whatever was deleted
+    lost_characters = len(orig) - len(change)
+    debug(f"TARGETING: net char los: {lost_characters}")
 
-    def find_mismatch(orig_iter: Iterator, change_iter: Iterator) -> Union[int, None]:
-        "walk the iterators and indicate where they produce different values"
-        i = 0
-        try:
-            while oc := next(orig_iter):
-                try:
-                    cc = next(change_iter)
-                except StopIteration:
-                    return i
-                if oc != cc:
-                    return i
-                else:
-                    i += 1
-        except StopIteration:
-            return None
-        return i or None
+    # align outpt with above label
+    def dbg(message):
+        debug(indent(str(message), prefix="           "))
 
-    delta = len(orig) - len(change)
-    if not delta:
-        first_change = last_change = None
+    # is this what the user deleted?
+    def fits(ranges):
+
+        # what would go?
+        maybe_deleted = []
+        for r in ranges:
+            maybe_deleted.append(orig[r[0] : r[1]])
+        maybe_deleted_str = "\n--\n".join(maybe_deleted)
+        range_str = ",".join([f"{x[0]}-{x[1]}" for x in ranges])
+        dbg(
+            f"candidate deletion {range_str}:\n"
+            + indent(maybe_deleted_str, prefix="  ")
+        )
+
+        # what would stay?
+        preserved = []
+        end = len(noise)
+        dbg("preserving")
+        for prev_r, r in zip([(None, None)] + ranges, ranges):
+            start = prev_r[1] or 0
+            end = r[0]
+            p_range = noise[start:end]
+            dbg(indent(p_range, prefix="  "))
+            preserved.append(p_range)
+            dbg("  --")
+        p_range = noise[end + 1 :]
+        dbg(indent(p_range, prefix="  "))
+        preserved.append(p_range)
+        preserved_str = "".join(preserved)
+
+        # show what's being compared
+        comparisons = "\n--\n".join([change, preserved_str])
+        dbg(f"comparing:\n" + indent(comparisons, prefix="  "))
+
+        # if what would change is what actually changed
+        if preserved_str == change:
+            return True
+
+    # if the user added characters (perhaps by a yank/put)
+    # revert states, mark no changes
+    if not lost_characters:
+        return ([], None)
+
+    # walk the deleted range
+    # see which manipuluation to the noise makes it match the change
+    candidate = None
+    min_start = cursor_pos - lost_characters
+
+    # maybe it started at the cursor position (x, dw, d$)
+    candidate = (cursor_pos, cursor_pos + lost_characters)
+    if fits([candidate]):
+        dbg(f"marking from {candidate[0]} to {candidate[1]} ")
+        return ([candidate], None)
+
+    # maybe it started before the cursor position (dd, diw)
     else:
+        for i in range(min_start, cursor_pos):
+            if i >= 0:
+                maybe_deleted = noise[i : i + lost_characters]
+                dbg(f"trying: {min_start + i}-{cursor_pos}: ({maybe_deleted})")
+                precandidate = (
+                    change[i:cursor_pos] + change[cursor_pos + lost_characters - 1 :]
+                )
 
-        first_change = find_mismatch(iter(orig), iter(change))
-        if first_change != None and first_change >= len(orig):
-            first_change = None
+                if noise[:i] + noise[i + lost_characters] == change:
+                    candidate = (i, i + lost_characters)
+                    break
 
-        from_back = find_mismatch(reversed(orig), reversed(change))
-        if from_back == None or from_back >= len(orig):
-            last_change = None
-        else:
-            last_change = len(orig) - from_back
-            if last_change >= len(orig):
-                last_change = None
+    if candidate and len(prev_selections) <= 1:
+        # if there were not previously multiple selections, then the
+        # above match is correct, and so is the cursor position
+        dbg(f"marking from {candidate[0]} to {candidate[1]} ")
+        return ([candidate], None)
 
-        first_change = first_change or 0
-        last_change = last_change or len(orig) - 1
+    else:
+        # otherwise, try deleting all previous selections
+        fragments = []
+        for prev_sel, sel in zip([(None, None)] + prev_selections, prev_selections):
+            not_del_start = prev_sel[1] or 0
+            not_del_end = sel[0]
+            fragments.append(noise[not_del_start:not_del_end])
+        fragments = "".join(fragments)
 
-        if last_change <= first_change:
-            debug(
-                f"naievely got {first_change} to {last_change}, length_delta: {delta} "
-                f"Resolving via: cursor_pos {cursor_pos}->{prev_cursor_pos}"
-            )
-            if cursor_pos >= prev_cursor_pos:
-                first_change = cursor_pos
-                last_change = cursor_pos + delta
-                new_cursor_pos = None
-            else:
-                last_change = prev_cursor_pos
-                first_change = prev_cursor_pos - delta
-                new_cursor_pos = None
+        if "".join(fragments) == change:
+            dbg(f"           marking previous selection")
+            return (prev_selections, None)
 
-    debug(
-        f"targeted from {first_change} to {last_change}, cursor_pos {cursor_pos}->{prev_cursor_pos}"
-    )
-    return first_change, last_change, new_cursor_pos
+        elif candidate:
+            # or maybe the previous selections are irrelevant
+            # go with the candidate found above
+            dbg(f"           marking from {candidate[0]} to {candidate[1]} ")
+            return ([candidate], None)
+
+    raise NotImplementedError("failed to target changes")
+
+    # first assume that there was only one change
 
 
-def toggled(noise, _state, start, end) -> List[Kind]:
+def toggled(noise, state, toggled_ranges) -> List[Kind]:
     "The user has indicated a range, change the state for those chars"
 
-    if not _state:
-        # initialize all chars as signal if no state is found
+    # initialize all chars as signal if no state is found
+    if not state:
+        debug(f"TOGGLED: state is uninitialized, marking all signal")
         return [Kind.signal for _ in noise]
 
-    if start == end or end == None:
-        return _state
-    debug(f"toggling, rage: {start}, {end}")
+    # which states are changing?
+    targeted_states = set()
+    targeted_indices = set()
+    for i, s in enumerate(state):
+        for tr in toggled_ranges:
+            if i in tr:
+                targeted_indices.add(i)
+                targeted_states.add(s)
 
-    sig = 0
-    noise = 0
-    for i in range(start, end):
-        if _state[i] in signal_kinds:
-            sig += 1
-        elif _state[i] in noise_kinds:
-            noise += 1
-        else:
-            raise ValueError(f"What's {_state[i]}?")
+    # if none, exit early
+    if not targeted_states:
+        return state
 
-    prefix = _state[:start]
-    suffix = _state[end:]
-    debug(f"sigs in toggle: {sig}")
-    debug(f"noise in toggle: {noise}")
-    if sig:
-        target_state = Kind.noise
+    if any(filter(lambda x: x == Kind.signal, targeted_states)):
+        # mark as noise if any are signal
+        disposition = Kind.noise
     else:
-        target_state = Kind.signal
+        # otherwise mark as signal
+        disposition = Kind.signal
+    debug(f"         marking as {disposition}")
 
-    return prefix + [target_state for _ in range(start, end)] + suffix
+    for i in targeted_indices:
+        state[i] = disposition
+    return state
 
 
 signal_kinds = [Kind.signal, Kind.parameter]
@@ -374,13 +432,16 @@ subcanvasses_display = BufferControl(
     buffer=subcanvas_summaries, lexer=SubcanvasSummaryLexer()
 )
 
-cursor_pos = 0
 prev_cursor_pos = 0
 reentrancy = 0
 iterations = 0
 
 prev_event = None
 prev_selection_ranges = None
+
+
+class BufferUpdateException(Exception):
+    pass
 
 
 def update(event):
@@ -391,7 +452,6 @@ def update(event):
     global char_states
     global debug_display
     global debug_buffer
-    global cursor_pos
     global prev_cursor_pos
     global reentrancy
     global prev_event
@@ -405,24 +465,33 @@ def update(event):
     if reentrancy == 1:
         iterations += 1
 
+        # if something goes wrong below, write to debug output before
+        # raising the exception
         try:
 
+            # write event info to debug
             debug(f"iteration: {iterations}")
             debug(format_event(event))
-
             selection_ranges = list(event.document.selection_ranges())
             debug(f"selection: {selection_ranges}")
             if prev_selection_ranges:
                 debug(f"prevous selection: {prev_selection_ranges}")
 
+            cursor_pos = event._Buffer__cursor_position
+
             # look for user changes
-            begin, end, cursor_position_override = find_targeted(
-                noise, buffer.text, cursor_pos, prev_cursor_pos
+            targeted_ranges, cursor_position_override = find_targeted(
+                noise,
+                buffer.text,
+                cursor_pos,
+                prev_cursor_pos,
+                selection_ranges,
+                prev_selection_ranges,
             )
 
             # update which characters are in/excluded based on what changed
             debug("char_states: " + str(char_states))
-            char_states = toggled(noise, char_states, begin, end)
+            char_states = toggled(noise, char_states, targeted_ranges)
 
             # show user recent changes
             try:
@@ -465,12 +534,13 @@ def update(event):
                     interval_starts.append(str(subcanvas.begin))
                 subcanvas_summaries.text = "\n".join(interval_starts)
 
-                if not cursor_position_override:
-                    if end and end > event._Buffer__cursor_position:
-                        debug(f"setting cursor_position: {end}")
-                        cursor_position_override = end
+                # if not cursor_position_override:
+                #    if end and end > event._Buffer__cursor_position:
+                #        debug(f"setting cursor_position: {end}")
+                #        cursor_position_override = end
 
                 # set cursor position
+                debug(f"Cursor position override: {cursor_position_override}")
                 buffer.cursor_position = (
                     cursor_position_override or event._Buffer__cursor_position
                 )
@@ -478,10 +548,16 @@ def update(event):
                 cursor_pos = buffer.cursor_position
 
         except Exception as ex:
+            new_ex = BufferUpdateException(
+                "\n---\n".join(
+                    [pending_debug_buffer, debug_buffer, traceback.format_exc()]
+                )
+            )
+            raise new_ex from ex
             # don't hide debug data just because we got an exception
-            print(pending_debug_buffer)
-            print(debug_buffer)
-            raise ex
+            # print(pending_debug_buffer)
+            # print(debug_buffer)
+            # raise ex
 
     # run at the end of the outermost call
     reentrancy -= 1
