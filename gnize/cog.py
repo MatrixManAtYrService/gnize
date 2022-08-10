@@ -180,9 +180,64 @@ class Error:
     def __lt__(self, other):
         return (self.original + self.user_change) < other
 
+class ChangeTheory:
+    def __init__(self, orig, change, curor_pos, prev_cursor_pos, prev_selection_ranges):
+        self.orig = orig
+        self.change = orig
+        self.delta = len(orig) - len(change)
+        self.cursor_pos = cursor_pos
+        self.prev_cursor_pos = prev_cursor_pos
+        self.prev_selection_ranges = prev_selection_ranges
+
+
+    def replay_change(self) -> str:
+        """
+        assume the theory is correct an apply the candidate change to the original string
+        if it's a good assumption, the result will match the recently edited string
+        """
+        raise NotImplementedError("override this in an actual theory, not the base class")
+
+class DeletedSelection(ChangeTheory):
+    def __init__(self, *args):
+        super().__init__(*args)
+
+    def replay_change(self) -> str:
+        "preserve chars that were not previously selected"
+        result = ""
+        for i in range(len(self.orig)):
+            in_selection = filter(lambda x: x[0] <= i <= x[1], self.prev_selection_ranges)
+            if not any(in_selection):
+                result += self.orig[i]
+        return result
+
+class DeletedLine(ChangeTheory):
+    def __init__(self, *args):
+        super().__init__(*args)
+
+    def replay_change(self) -> str:
+        "preserve chars that were not on the cursor's line"
+
+        lines = []
+        deleted = False
+        chars_so_far = 0
+        for i, line in enumerate(self.orig.split('\n')):
+            l = len(line)
+            chars_so_far += l + 1
+            if not deleted and chars_so_far > self.prev_cursor_pos:
+                # skip whichever line contains the prev_cursor_pos
+                deleted = True
+            else:
+                lines.append(line)
+
+        return '\n'.join(lines)
+
+
+
+
+
 
 def find_targeted(
-    orig: str, change: str, cursor_pos: int, prev_cursor_pos: int
+    orig: str, change: str, cursor_pos: int, prev_cursor_pos: int, prev_selection_ranges: List[Tuple[int, int]]
 ) -> Tuple[Union[int, None], Union[int, None], Union[int, None]]:
     """
     Given two strings, the first being the original and the second
@@ -210,7 +265,7 @@ def find_targeted(
         return i or None
 
     delta = len(orig) - len(change)
-    if not delta:
+    if delta <= 0:
         first_change = last_change = None
     else:
 
@@ -417,7 +472,7 @@ def update(event):
 
             # look for user changes
             begin, end, cursor_position_override = find_targeted(
-                noise, buffer.text, cursor_pos, prev_cursor_pos
+                noise, buffer.text, cursor_pos, prev_cursor_pos, prev_selection_ranges
             )
 
             # update which characters are in/excluded based on what changed
