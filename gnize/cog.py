@@ -57,7 +57,7 @@ from enum import Enum, auto
 from io import StringIO
 from pprint import pformat
 from textwrap import dedent, indent
-from typing import Iterator, List, Tuple, Union
+from typing import Iterator, List, Tuple, Union, Dict, Optional
 
 import yaml
 from intervaltree import Interval, IntervalTree
@@ -180,128 +180,125 @@ class Error:
     def __lt__(self, other):
         return (self.original + self.user_change) < other
 
+
 class ChangeTheory:
-    def __init__(self, orig, change, curor_pos, prev_cursor_pos, prev_selection_ranges):
+    "An explanation for what the user just did"
+
+    def __init__(self, orig, change, cursor_pos, prev_cursor_pos, prev_selection_ranges):
         self.orig = orig
-        self.change = orig
+        self.change = change
         self.delta = len(orig) - len(change)
         self.cursor_pos = cursor_pos
         self.prev_cursor_pos = prev_cursor_pos
         self.prev_selection_ranges = prev_selection_ranges
 
+    def replay_change(self) -> Dict[str, List[Tuple[int, int]]]:
+        """
+        Assume the theory is correct an apply the candidate change to the original string
+        if it's a good assumption, a key in the returned dict will match the recently edited string.
 
-    def replay_change(self) -> str:
+        If that happens, that key's value indicates the targeted ranges.
         """
-        assume the theory is correct an apply the candidate change to the original string
-        if it's a good assumption, the result will match the recently edited string
-        """
-        raise NotImplementedError("override this in an actual theory, not the base class")
+        raise NotImplementedError(
+            "override this in an actual theory, not the base class"
+        )
+
+    def evaluate(self) -> Dict[str, Tuple[int, int]]:
+
+        targets_ranges = {}
+
+        for candidate, targeting in self.replay_change().items():
+            if candidate == self.change:
+                for t_from, t_to in targeting:
+                    targets_ranges[self.orig[t_from:t_to]] = (t_from, t_to)
+                break
+
+        return targets_ranges
+
+
+class NoChange(ChangeTheory):
+    def __init__(self, *args):
+        super().__init__(*args)
+
+    def replay_change(self) -> Dict[str, List[Tuple[int, int]]]:
+        return {self.orig: []}
+
 
 class DeletedSelection(ChangeTheory):
     def __init__(self, *args):
         super().__init__(*args)
 
-    def replay_change(self) -> str:
+    def replay_change(self) -> Dict[str, List[Tuple[int, int]]]:
         "preserve chars that were not previously selected"
         result = ""
         for i in range(len(self.orig)):
-            in_selection = filter(lambda x: x[0] <= i <= x[1], self.prev_selection_ranges)
+            in_selection = filter(
+                lambda x: x[0] <= i < x[1], self.prev_selection_ranges
+            )
             if not any(in_selection):
                 result += self.orig[i]
-        return result
+        return {result: self.prev_selection_ranges}
 
-class DeletedLine(ChangeTheory):
+
+class DeletedMotion(ChangeTheory):
     def __init__(self, *args):
         super().__init__(*args)
 
-    def replay_change(self) -> str:
-        "preserve chars that were not on the cursor's line"
+    def replay_change(self) -> Dict[str, List[Tuple[int, int]]]:
+        "use the delta to try for edits like 'dw' or 'diw' or 'd0'"
 
-        lines = []
-        deleted = False
-        chars_so_far = 0
-        for i, line in enumerate(self.orig.split('\n')):
-            l = len(line)
-            chars_so_far += l + 1
-            if not deleted and chars_so_far > self.prev_cursor_pos:
-                # skip whichever line contains the prev_cursor_pos
-                deleted = True
-            else:
-                lines.append(line)
+        candidates = {}
 
-        return '\n'.join(lines)
+        for offset in range(0, self.delta):
+            # try all cases where the entire delta is in a single span surrounding the cursor pos
+            deletion_span = (
+                self.cursor_pos - offset,
+                self.cursor_pos + self.delta - offset,
+            )
 
+            # only include it if it fits
+            debug(str(deletion_span))
+            if deletion_span[0] >= 0 or deletion_span[1] <= len(self.orig) - 1:
+                candidates[
+                    self.orig[: deletion_span[0]] + self.orig[deletion_span[1] :]
+                ] = [deletion_span]
 
-
-
+        return candidates
 
 
 def find_targeted(
-    orig: str, change: str, cursor_pos: int, prev_cursor_pos: int, prev_selection_ranges: List[Tuple[int, int]]
-) -> Tuple[Union[int, None], Union[int, None], Union[int, None]]:
+    orig: str,
+    change: str,
+    cursor_pos: int,
+    prev_cursor_pos: int,
+    prev_selection_ranges: List[Tuple[int, int]],
+) -> Tuple[List[Tuple[int, int]], Optional[int]]:
     """
-    Given two strings, the first being the original and the second
-    being whatever change the user applied, find the bounds of the
-    change.
+    Called after the user makes an edit.  Try to figure out what they did.
+    Returns a list of ranges for targeted substrings and a cursor position override
     """
-
-    new_cursor_pos = None
-
-    def find_mismatch(orig_iter: Iterator, change_iter: Iterator) -> Union[int, None]:
-        "walk the iterators and indicate where they produce different values"
-        i = 0
-        try:
-            while oc := next(orig_iter):
-                try:
-                    cc = next(change_iter)
-                except StopIteration:
-                    return i
-                if oc != cc:
-                    return i
-                else:
-                    i += 1
-        except StopIteration:
-            return None
-        return i or None
 
     delta = len(orig) - len(change)
-    if delta <= 0:
-        first_change = last_change = None
-    else:
-
-        first_change = find_mismatch(iter(orig), iter(change))
-        if first_change != None and first_change >= len(orig):
-            first_change = None
-
-        from_back = find_mismatch(reversed(orig), reversed(change))
-        if from_back == None or from_back >= len(orig):
-            last_change = None
-        else:
-            last_change = len(orig) - from_back
-            if last_change >= len(orig):
-                last_change = None
-
-        first_change = first_change or 0
-        last_change = last_change or len(orig) - 1
-
-        if last_change <= first_change:
-            debug(
-                f"naievely got {first_change} to {last_change}, length_delta: {delta} "
-                f"Resolving via: cursor_pos {cursor_pos}->{prev_cursor_pos}"
-            )
-            if cursor_pos >= prev_cursor_pos:
-                first_change = cursor_pos
-                last_change = cursor_pos + delta
-                new_cursor_pos = None
+    override_cursor_pos = None
+    if delta > 0:
+        for edit_theory in [DeletedMotion, DeletedSelection]:
+            candidate = edit_theory(
+                orig, change, cursor_pos, prev_cursor_pos, prev_selection_ranges
+            ).evaluate()
+            if candidate:
+                for interval in candidate.values():
+                    if prev_cursor_pos >= interval[0] and prev_cursor_pos < interval[1]:
+                        override_cursor_pos = interval[1]
+                debug(f"Targeting Strategy: {edit_theory.__name__}")
+                return (list(candidate.values()), override_cursor_pos)
             else:
-                last_change = prev_cursor_pos
-                first_change = prev_cursor_pos - delta
-                new_cursor_pos = None
+                debug(f"tried {edit_theory.__name__}, no luck")
+                debug(f"orig:\n{orig}\change:\n{change}\ncursor:{cursor_pos}\nprev:{prev_cursor_pos}")
+                return ([], None)
 
-    debug(
-        f"targeted from {first_change} to {last_change}, cursor_pos {cursor_pos}->{prev_cursor_pos}"
-    )
-    return first_change, last_change, new_cursor_pos
+    else:
+        # if text was added, just revert to the previous state
+        return ([], prev_cursor_pos)
 
 
 def toggled(noise, _state, start, end) -> List[Kind]:
@@ -435,7 +432,7 @@ reentrancy = 0
 iterations = 0
 
 prev_event = None
-prev_selection_ranges = None
+prev_selection_ranges = []
 
 
 def update(event):
@@ -463,21 +460,31 @@ def update(event):
         try:
 
             debug(f"iteration: {iterations}")
-            debug(format_event(event))
+            debug(format_event(event) + "\n")
 
             selection_ranges = list(event.document.selection_ranges())
             debug(f"selection: {selection_ranges}")
             if prev_selection_ranges:
                 debug(f"prevous selection: {prev_selection_ranges}")
 
+            prev_cursor_pos = cursor_pos
+            cursor_pos = buffer.cursor_position
+            debug(f"cursor is: {cursor_pos}, was: {prev_cursor_pos}")
+
             # look for user changes
-            begin, end, cursor_position_override = find_targeted(
+            target_ranges, cursor_position_override = find_targeted(
                 noise, buffer.text, cursor_pos, prev_cursor_pos, prev_selection_ranges
             )
+            debug("target_ranges: " + str(target_ranges))
 
             # update which characters are in/excluded based on what changed
             debug("char_states: " + str(char_states))
-            char_states = toggled(noise, char_states, begin, end)
+            if not target_ranges:
+                char_states = char_states or [Kind.signal for _ in noise]
+            else:
+                for begin, end in target_ranges:
+                    char_states = toggled(noise, char_states, begin, end)
+                    debug("char_states: " + str(char_states))
 
             # show user recent changes
             try:
@@ -520,17 +527,8 @@ def update(event):
                     interval_starts.append(str(subcanvas.begin))
                 subcanvas_summaries.text = "\n".join(interval_starts)
 
-                if not cursor_position_override:
-                    if end and end > event._Buffer__cursor_position:
-                        debug(f"setting cursor_position: {end}")
-                        cursor_position_override = end
-
                 # set cursor position
-                buffer.cursor_position = (
-                    cursor_position_override or event._Buffer__cursor_position
-                )
-                prev_cursor_pos = cursor_pos
-                cursor_pos = buffer.cursor_position
+                #buffer.cursor_position = cursor_position_override or cursor_pos
 
         except Exception as ex:
             # don't hide debug data just because we got an exception
