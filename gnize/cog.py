@@ -50,6 +50,7 @@ problem.  For now we just want create canvasses and query for them by fingerprin
 
 import atexit
 import sys
+import json
 from contextlib import redirect_stdout
 from dataclasses import dataclass
 from datetime import datetime
@@ -184,7 +185,7 @@ class Error:
 class ChangeTheory:
     "An explanation for what the user just did"
 
-    def __init__(self, orig, change, cursor_pos, prev_cursor_pos, prev_selection_ranges):
+    def __init__(self, orig, change, prev_cursor_pos, cursor_pos, prev_selection_ranges):
         self.orig = orig
         self.change = change
         self.delta = len(orig) - len(change)
@@ -192,7 +193,7 @@ class ChangeTheory:
         self.prev_cursor_pos = prev_cursor_pos
         self.prev_selection_ranges = prev_selection_ranges
 
-    def replay_change(self) -> Dict[str, List[Tuple[int, int]]]:
+    def replay_change(self) -> Dict[str, Tuple[int, List[Tuple[int, int]]]]:
         """
         Assume the theory is correct an apply the candidate change to the original string
         if it's a good assumption, a key in the returned dict will match the recently edited string.
@@ -203,32 +204,41 @@ class ChangeTheory:
             "override this in an actual theory, not the base class"
         )
 
-    def evaluate(self) -> Dict[str, Tuple[int, int]]:
+    def evaluate(self) -> Optional[Tuple[Optional[int], Dict[str, Tuple[int, int]]]]:
+        """
+        Given a theory, see if it explains the user's action.  If not, return None
+        If so, return:
+
+            (5, { "abc" : (15, 19) })
+
+        where:
+            5 is the new cursor position
+            "abc" is the targeted range contents
+            (15, 19) is the targeted range
+        """
 
         targets_ranges = {}
 
-        for candidate, targeting in self.replay_change().items():
+        new_cursor_pos = None
+        for candidate, (new_pos, targeting) in self.replay_change().items():
             if candidate == self.change:
+                debug_next(json.dumps(candidate))
+                debug_next("==")
+                debug_next(json.dumps(self.change))
+                debug_next("    ")
+                new_cursor_pos = new_pos
                 for t_from, t_to in targeting:
                     targets_ranges[self.orig[t_from:t_to]] = (t_from, t_to)
                 break
 
-        return targets_ranges
-
-
-class NoChange(ChangeTheory):
-    def __init__(self, *args):
-        super().__init__(*args)
-
-    def replay_change(self) -> Dict[str, List[Tuple[int, int]]]:
-        return {self.orig: []}
+        return (new_cursor_pos, targets_ranges)
 
 
 class DeletedSelection(ChangeTheory):
     def __init__(self, *args):
         super().__init__(*args)
 
-    def replay_change(self) -> Dict[str, List[Tuple[int, int]]]:
+    def replay_change(self) -> Dict[str, Tuple[Optional[int], List[Tuple[int, int]]]]:
         "preserve chars that were not previously selected"
         result = ""
         for i in range(len(self.orig)):
@@ -237,14 +247,21 @@ class DeletedSelection(ChangeTheory):
             )
             if not any(in_selection):
                 result += self.orig[i]
-        return {result: self.prev_selection_ranges}
+
+
+        new_pos = None
+        for selection_range in self.prev_selection_ranges:
+            if selection_range[0] <= self.cursor_pos <= selection_range[1]:
+                new_pos = selection_range[1]
+
+        return {result: (new_pos, self.prev_selection_ranges)}
 
 
 class DeletedMotion(ChangeTheory):
     def __init__(self, *args):
         super().__init__(*args)
 
-    def replay_change(self) -> Dict[str, List[Tuple[int, int]]]:
+    def replay_change(self) -> Dict[str, Tuple[Optional[int], List[Tuple[int, int]]]]:
         "use the delta to try for edits like 'dw' or 'diw' or 'd0'"
 
         candidates = {}
@@ -256,12 +273,22 @@ class DeletedMotion(ChangeTheory):
                 self.cursor_pos + self.delta - offset,
             )
 
+            #new_pos = deletion_span[-1]
+            #if self.cursor_pos in deletion_span:
+            #    if self.prev_cursor_pos <= self.cursor_pos:
+            #        new_pos = deletion_span[1]
+            #    else:
+            #        new_pos = max(deletion_span[0] - 1, 0)
+            new_pos = None
+
+
             # only include it if it fits
-            debug(str(deletion_span))
             if deletion_span[0] >= 0 or deletion_span[1] <= len(self.orig) - 1:
+                new_pos = deletion_span[1]
                 candidates[
                     self.orig[: deletion_span[0]] + self.orig[deletion_span[1] :]
-                ] = [deletion_span]
+                ] = (new_pos, [deletion_span])
+
 
         return candidates
 
@@ -274,31 +301,29 @@ def find_targeted(
     prev_selection_ranges: List[Tuple[int, int]],
 ) -> Tuple[List[Tuple[int, int]], Optional[int]]:
     """
-    Called after the user makes an edit.  Try to figure out what they did.
+    Called after the user makes an edit.  Tries to figure out what they did.
     Returns a list of ranges for targeted substrings and a cursor position override
     """
 
     delta = len(orig) - len(change)
-    override_cursor_pos = None
     if delta > 0:
         for edit_theory in [DeletedMotion, DeletedSelection]:
-            candidate = edit_theory(
-                orig, change, cursor_pos, prev_cursor_pos, prev_selection_ranges
+            new_cursor_pos, candidate = edit_theory(
+                orig, change, prev_cursor_pos, cursor_pos, prev_selection_ranges
             ).evaluate()
             if candidate:
-                for interval in candidate.values():
-                    if prev_cursor_pos >= interval[0] and prev_cursor_pos < interval[1]:
-                        override_cursor_pos = interval[1]
+
                 debug(f"Targeting Strategy: {edit_theory.__name__}")
-                return (list(candidate.values()), override_cursor_pos)
+                debug(f"New Cursor Pos: {new_cursor_pos}")
+                return (list(candidate.values()), new_cursor_pos)
             else:
                 debug(f"tried {edit_theory.__name__}, no luck")
-                debug(f"orig:\n{orig}\change:\n{change}\ncursor:{cursor_pos}\nprev:{prev_cursor_pos}")
-                return ([], None)
+        debug(f"Ran out of theories, reverting change")
+        return ([], prev_cursor_pos)
 
     else:
         # if text was added, just revert to the previous state
-        return ([], prev_cursor_pos)
+        return ([], None)
 
 
 def toggled(noise, _state, start, end) -> List[Kind]:
@@ -499,6 +524,8 @@ def update(event):
                 SubcanvasSummaryLexer.it = intervals
 
                 # show the user which characters are of which kind
+                debug("buffer: " + json.dumps(buffer.text))
+                debug("noise: " + json.dumps(noise))
                 buffer.text = noise
 
                 subcanvasses = sorted(intervals)
@@ -528,7 +555,8 @@ def update(event):
                 subcanvas_summaries.text = "\n".join(interval_starts)
 
                 # set cursor position
-                #buffer.cursor_position = cursor_position_override or cursor_pos
+                if cursor_position_override:
+                    buffer.cursor_position = cursor_position_override
 
         except Exception as ex:
             # don't hide debug data just because we got an exception

@@ -7,8 +7,25 @@ def test_deleted_selection():
     edited = "abcghijkop"
     prev_selection = [(3, 6), (11,14)]
 
-    theory = DeletedSelection(original, edited, 0, prev_selection)
-    assert theory.evaluate() == {"def" : (3,6), "lmn": (11, 14)}
+    theory = DeletedSelection(original, edited, 10, 11, prev_selection)
+    assert theory.evaluate() == (15, {"def" : (3,6), "lmn": (11, 14)})
+
+def test_not_deleted_motion():
+    original = dedent(
+        """
+        abcd
+        efgh
+        """
+    ).strip()
+    edited = dedent(
+        """
+        bcd
+        fgh
+        """
+    ).strip()
+    prev_selection = [(0, 1), (5, 6)]
+    theory = DeletedMotion(original, edited, 12, 13, prev_selection)
+    assert theory.evaluate() == (None, {})
 
 def test_deleted_line():
     original = dedent(
@@ -25,8 +42,8 @@ def test_deleted_line():
         """
     ).strip()
 
-    theory = DeletedMotion(original, edited, 4, [])
-    assert theory.evaluate() == {"\ndef": (3, 7)}
+    theory = DeletedMotion(original, edited, 4, 4, [])
+    assert theory.evaluate() == (7, {"\ndef": (3, 7)})
 
 def test_deleted_word():
     original = dedent(
@@ -40,8 +57,8 @@ def test_deleted_word():
         """
     ).strip()
 
-    theory = DeletedMotion(original, edited, 4, [])
-    assert theory.evaluate() == {" def": (3, 7)}
+    theory = DeletedMotion(original, edited, 3, 4, [])
+    assert theory.evaluate() == (7, {" def": (3, 7)})
 
 
 def test_deleted_linebegin():
@@ -56,8 +73,8 @@ def test_deleted_linebegin():
         """
     ).strip()
 
-    theory = DeletedMotion(original, edited, 0, [])
-    assert theory.evaluate() == {"abc ": (0, 4)}
+    theory = DeletedMotion(original, edited, 0, 0, [])
+    assert theory.evaluate() == (4, {"abc ": (0, 4)})
 
 
 def test_deleted_innerword():
@@ -72,8 +89,8 @@ def test_deleted_innerword():
         """
     ).strip()
 
-    theory = DeletedMotion(original, edited, 4, [])
-    assert theory.evaluate() == {" def": (3, 7)}
+    theory = DeletedMotion(original, edited, 3, 4, [])
+    assert theory.evaluate() == (7, {" def": (3, 7)})
 
 def test_deleted_lineend():
     original = dedent(
@@ -89,5 +106,5 @@ def test_deleted_lineend():
         """
     ).strip()
 
-    theory = DeletedMotion(original, edited, 1, [])
-    assert theory.evaluate() == {"b": (1, 2)}
+    theory = DeletedMotion(original, edited, 0, 1, [])
+    assert theory.evaluate() == (2, {"b": (1, 2)})
